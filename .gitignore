@@ -26,7 +26,7 @@ regional_clarity/xg_models/hypertune/
 # ...except Quarto's frozen Rmd results, which the site build needs
 !_freeze/**/*.png
 
-# rendered Quarto site (published to the gh-pages branch, not tracked on main)
+# rendered Quarto site (built and deployed by .github/workflows/publish.yml)
 /_site/
 
 

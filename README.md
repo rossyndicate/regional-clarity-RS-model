@@ -132,18 +132,17 @@ python3.11 -m venv .venv
 
 ## Building the site
 
-The site is a [Quarto](https://quarto.org) website (`_quarto.yml`, `index.qmd`). It builds into `_site/` (not tracked) and is published to the `gh-pages` branch, which GitHub Pages serves. Quarto ships with RStudio and Positron. From the repository root:
+The site is a [Quarto](https://quarto.org) website (`_quarto.yml`, `index.qmd`). It builds into `_site/` (not tracked). On every push to `main`, a GitHub Action (`.github/workflows/publish.yml`) renders the site and deploys it to GitHub Pages, so there is no `gh-pages` branch and no rendered HTML in the repo. Quarto ships with RStudio and Positron. From the repository root:
 
 ```
 quarto render                                          # whole site, into _site/
 quarto render regional_clarity/02a_make_matches.Rmd     # one page
 quarto preview                                         # local preview with live reload
-quarto publish gh-pages                                # render and push to the gh-pages branch
 ```
 
 - **Notebooks are never executed by Quarto.** Their pages use the outputs saved in the `.ipynb`, so run a notebook and save it before rendering.
-- **Rmds are executed, then frozen.** Results are stored in `_freeze/` (tracked in git) and reused until that Rmd's source changes. Commit `_freeze/` along with the Rmd so the site can be rebuilt without the data. The slow steps inside each Rmd are cached to disk, so a re-render mostly reloads those caches.
-- The two `pull_*` Rmds are shown as code only (`execute: eval: false` in their front matter) so a site build never re-runs the web fetches.
+- **Rmds are executed, then frozen.** Results are stored in `_freeze/` (tracked in git) and reused until that Rmd's source changes. Commit `_freeze/` along with the Rmd so the site can be rebuilt without the data. The Action relies on this: it has no R, Python, or data, so an Rmd pushed without its re-rendered `_freeze/` will fail the deploy. The slow steps inside each Rmd are cached to disk, so a re-render mostly reloads those caches.
+- 02b and 02c are shown as code only (`execute: eval: false` in their front matter) so a site build never re-runs the web fetches.
 - Keep the diagram above in sync with `pipeline_diagram.mmd`.
 
 ## Secrets/credentials
