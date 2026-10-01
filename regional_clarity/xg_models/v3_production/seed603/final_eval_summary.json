@@ -1,0 +1,68 @@
+{
+  "xgboost": {
+    "features": [
+      "atm_corr_LaSRC",
+      "green_corr7",
+      "nir_corr7",
+      "swir1_corr7",
+      "temp_corr7",
+      "precip_mm_prev1",
+      "tmean_degC_prev7",
+      "srad_Wm2_prev1",
+      "precip_mm_prev3",
+      "srad_Wm2_prev7",
+      "precip_mm_prev7",
+      "tmax_degC_prev7",
+      "tmin_degC_prev7",
+      "tmean_degC_prev30",
+      "tmin_degC_prev30",
+      "srad_Wm2_prev30",
+      "BR",
+      "BG",
+      "NR",
+      "fai",
+      "NDVI",
+      "NDSSI",
+      "NDWI",
+      "MNDWI",
+      "catchment_area_sqkm",
+      "pct_impervious_2006",
+      "pct_urban_2006",
+      "pct_forest_2006",
+      "pct_cropland_2006",
+      "pct_wetland_2006",
+      "shore_flag",
+      "precip_mm_prev30",
+      "tmax_degC_prev30"
+    ],
+    "params": {
+      "eta": 0.03,
+      "max_depth": 3,
+      "min_child_weight": 10,
+      "subsample": 0.6,
+      "colsample_bytree": 0.5,
+      "reg_alpha": 5,
+      "reg_lambda": 5
+    },
+    "cv_metrics": {
+      "rmse": 1.5282728158695333,
+      "mae": 1.0527523346598644,
+      "mape": 0.6856808324967545,
+      "bias": 0.032255498338717915,
+      "p_bias": 0.9857276903976662,
+      "smape": 0.3975949267567981,
+      "r2": 0.6214418212433139,
+      "n": 8937
+    },
+    "test_metrics": {
+      "rmse": 1.2704247994022926,
+      "mae": 0.948477360817755,
+      "mape": 0.4104718780654332,
+      "bias": 0.16240368508228042,
+      "p_bias": 4.958259753784277,
+      "smape": 0.3144359673573832,
+      "r2": 0.6100237300964304,
+      "n": 2206
+    }
+  }
+}

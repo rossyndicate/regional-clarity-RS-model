@@ -1,0 +1,600 @@
+---
+title: "Make Matchups"
+author: "B Steele, Colorado State University, ROSSyndicate"
+date: "last updated Sep 19, 2026"
+output:
+  html_document:
+    fig_retina: 1
+---
+
+**Pipeline step 02a · R · run from the repository root**
+
+- **Purpose:** Match filtered SDD to siteSR within a 5-day window, drop matchups with a rain event in the gap, and keep the closest image per in situ sample.
+- **Inputs:** `aquamatch_files/`: `sdd_quality_filter.parquet`, `siteSR_DSWE1_regional_band_filtered.parquet`, `huc4_filtered.gdb`, `states.gdb`, `row_loss_log_01.csv`; site metadata CSV; gridMET (cached).
+- **Outputs:** `aquamatch_files/`: `filtered_regional_sdd.parquet` (modeling matchups), `regional_sdd_not_closest.parquet`, `sdd_regional_siteSR_matchups_5d.parquet`, `match_gap_precip_raw.feather`, `row_loss_log.csv`.
+- **Previous:** [01 · Filter AquaMatch data](01_filter_AquaMatch_Data.Rmd) · **Next:** [02b · Pull site characteristics](02b_pull_site_characteristics.Rmd), [02c · Pull weather summaries](02c_pull_weather_summaries.Rmd), then [03 · Split data](03_split_data.ipynb)
+
+This code creates matchups between the filtered AquaMatch SDD and siteSR
+files (from `01_filter_AquaMatch_Data.Rmd`) using a 5-day window.
+Both inputs are already scoped to the HUC4 basins that make up this
+project's 6-state regional AOI (that scoping happens in
+`01_filter_AquaMatch_Data.Rmd`, before the expensive per-site filtering
+there runs), so the "Subset to the regional AOI" section below is a
+labeling/sanity-check step rather than an additional filter.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+Load packages and set paths to the filtered SDD and siteSR caches from
+[01](01_filter_AquaMatch_Data.Rmd) and to AquaMatch's site metadata.
+`AquaMatchr` performs the matching. `climateR` and `parallel` support the
+rain screen further below. `tmap` draws the maps.
+
+```{r libraries, , message = FALSE, warning=FALSE}
+# load libraries
+library(AquaMatchr) # if install needed: remotes::install_github(repo = "AquaSat/AquaMatchr")
+library(data.table)
+library(arrow)
+library(sf)
+library(tmap)
+library(tigris)
+library(tidyverse)
+library(climateR)
+library(parallel)
+
+aquamatch_raw_data_dir <- "regional_clarity/aquamatch_files/downloads"
+filtered_aquamatch_dir <- "regional_clarity/aquamatch_files"
+
+# outputs from 01_filter_AquaMatch_Data.Rmd
+sdd_filtered_path <- file.path(filtered_aquamatch_dir, "sdd_quality_filter.parquet")
+siteSR_regional_filtered_path <- file.path(filtered_aquamatch_dir, "siteSR_DSWE1_regional_band_filtered.parquet")
+sr_sites <- file.path(aquamatch_raw_data_dir, "siteSR_collated_WQP_NWIS_sites_with_NHD_info_2025-06-04.csv")
+```
+
+## Make matches with the filtered data
+
+Use the regionally band-filtered siteSR data (rather than the full
+nationwide `unified_data`) as the input to matching, so a site flagged in
+script 01 simply isn't a match candidate.
+
+`match_siteSR_to_WQP()` only accepts `.csv`/`.feather` for its WQP input and
+hard-codes `.feather` for its siteSR input - parquet isn't a supported input
+format for this AquaMatchr function. Our filtered caches from script 01 are
+parquet (see that script's note on preferring parquet everywhere it isn't
+required to be otherwise), so we write throwaway feather copies just for
+this call and delete them immediately after.
+
+Only SDD observations that RANSAC kept (or could not evaluate) are passed
+to the matcher. Every siteSR observation at the same site within ±5 days of
+an SDD sample becomes a candidate matchup. The result is cached, so later
+renders read it from disk.
+
+```{r run-siteSR-wqp-match, message = FALSE, warning=FALSE}
+out_file <- file.path(filtered_aquamatch_dir, "sdd_regional_siteSR_matchups_5d.parquet")
+
+if (file.exists(out_file)) {
+  sdd_match <- read_parquet(out_file)
+} else {
+  # throwaway feather copies, required by match_siteSR_to_WQP()'s input format
+  sdd_filtered_feather <- tempfile(fileext = ".feather")
+  siteSR_regional_filtered_feather <- tempfile(fileext = ".feather")
+  # is_inlier == FALSE is a RANSAC-flagged SDD outlier (see
+  # 01_filter_AquaMatch_Data.Rmd); NA (RANSAC never resolved, e.g. too few
+  # points at that site) is kept rather than assumed guilty
+  write_feather(read_parquet(sdd_filtered_path) %>%
+                  filter(is_inlier | is.na(is_inlier)),
+                sdd_filtered_feather)
+  write_feather(read_parquet(siteSR_regional_filtered_path), siteSR_regional_filtered_feather)
+  
+  # Run the matchups with a 5-day window
+  match_siteSR_to_WQP(
+    wqp_path = sdd_filtered_feather,
+    siteSR_path = siteSR_regional_filtered_feather,
+    site_list_path = sr_sites,
+    save_location = out_file,
+    time_window = "5 days"
+  )
+  
+  file.remove(sdd_filtered_feather, siteSR_regional_filtered_feather)
+  
+  sdd_match <- read_parquet(out_file)
+}
+
+```
+
+Let's confirm we're only matching Lake data for our purposes and that the
+Great Lakes were already excluded - this is a sanity check on the site
+filters already applied upstream, not an additional filter.
+
+```{r lakes-only}
+lake_sdd <- sdd_match %>%
+  filter(
+    # select for lake/reservoir only
+    grepl("Lake|Reservoir", MonitoringLocationTypeName),
+    # remove the great lakes for this matching process
+    !grepl("Great", MonitoringLocationTypeName)
+  )
+
+# check to see if these are the same
+nrow(lake_sdd) == nrow(sdd_match)
+```
+
+## Summary Figures
+
+Read AquaMatch's site metadata for site coordinates.
+
+```{r site-list, message = FALSE, warning=FALSE}
+sites <- read_csv(sr_sites, show_col_types = FALSE)
+```
+
+Convert the sites that have at least one matchup to spatial points and keep
+those within the contiguous United States (CONUS) for mapping.
+
+```{r conus-only, , message = FALSE, warning=FALSE}
+sites_w_matches <- sites %>%
+  filter(siteSR_id %in% unique(sdd_match$siteSR_id)) %>%
+  st_as_sf(coords = c("WGS84_Longitude", "WGS84_Latitude"), crs = "EPSG:4326")
+
+# let's drop the ones that are outside the CONUS for the purposes of this
+conus <- suppressMessages(states(progress_bar = FALSE)) %>%
+  filter(!grepl("AK|AS|MP|VI|HI|PR|GU", STUSPS))
+
+lake_locs_CONUS <- sites_w_matches %>%
+  st_transform(., st_crs(conus)) %>%
+  .[conus,] %>%
+  st_transform(., st_crs(sites_w_matches))
+```
+
+Map every site with at least one matchup.
+
+```{r}
+tm_shape(conus) +
+  tm_borders() +
+  tm_shape(lake_locs_CONUS) +
+  tm_dots()
+```
+
+Count matchups per site and attach the counts to the site locations.
+
+```{r summary-by-site}
+# summarize by number of matches per site
+five_day_summary <- sdd_match %>%
+  summarize(n = n(),
+            .by = siteSR_id)
+
+# add in spatial data
+lake_locs_with_matches <- lake_locs_CONUS %>%
+  filter(siteSR_id %in% unique(sdd_match$siteSR_id)) %>%
+  left_join(., five_day_summary)
+```
+
+Plot site locations colored by number of matchups (all Landsat missions
+combined).
+
+```{r plot-all-missions}
+# plot all missions
+tm_shape(conus) +
+  tm_polygons() +
+  tm_shape(lake_locs_with_matches, bbox = conus) +
+  tm_dots("n",
+          fill.scale = tm_scale(breaks = c(1, 10, 25, 50, 75, 100,
+                                           500, 1000, 1500),
+                                values = "viridis"),
+          size = 0.5,
+          fill_alpha = 0.5) +
+  tm_layout(legend.position = tm_pos_in("right", "bottom"),
+            legend.bg.color = "white",
+            legend.frame = TRUE)
+```
+
+Repeat the map for each Landsat mission separately. Each panel title gives
+that mission's total matchups and sites, which shows how the record is
+distributed across sensors.
+
+```{r summary-by-mission}
+# and per site per mission
+five_day_summary_sensor <- sdd_match %>%
+  summarize(n = n(),
+            .by = c(siteSR_id, mission))
+
+# add spatial data and label info
+lake_locs_by_mission <- lake_locs_CONUS %>%
+  select(siteSR_id, geometry) %>%
+  right_join(five_day_summary_sensor, by = "siteSR_id") %>%
+  mutate(mission = factor(mission,
+                          levels = c("LT04", "LT05", "LE07", "LC08", "LC09"),
+                          labels = c("Landsat 4", "Landsat 5", "Landsat 7", "Landsat 8", "Landsat 9")))%>%
+  arrange(n)
+
+# Compute totals per mission before faceting
+mission_stats <- lake_locs_by_mission %>%
+  st_drop_geometry() %>%
+  summarize(total_matches = sum(n),
+            total_sites = n_distinct(siteSR_id),
+            .by = mission)
+
+# and prep for viz
+lake_locs_by_mission <- lake_locs_by_mission %>%
+  left_join(mission_stats, by = "mission") %>%
+  mutate(mission_label = paste0(mission, ", ",
+                                format(total_matches, big.mark = ","), " matches, ",
+                                format(total_sites, big.mark = ","), " sites")) %>%
+  arrange(n)
+
+# plot!
+tm_shape(conus) +
+  tm_polygons() +
+  tm_shape(lake_locs_by_mission, bbox = conus) +
+  tm_dots("n",
+          fill.scale = tm_scale(values = "viridis"),
+          fill.legend = tm_legend(position = tm_pos_on_top(pos.h = "right", pos.v = "bottom"),
+                                  bg.color = "white",
+                                  frame = TRUE, text.size = 1),
+          size = 0.5,
+          fill_alpha = 0.5) +
+  tm_facets_wrap(by = "mission_label", ncol = 2, nrow = 3)
+```
+
+## Subset to the regional AOI
+
+`siteSR` was already scoped to our 6-state region's HUC4 footprint upstream
+in `01_filter_AquaMatch_Data.Rmd` (see that script's "Regional AOI" section)
+- there's no regional-context-dependent processing between that scoping and
+here, so every match in `sdd_match` should already fall inside it. We read
+back the HUC4/state boundaries 01 already computed and wrote out, rather
+than re-running the HUC4 download/overlap calculation, and use them here
+only to label each site with its HUC4 (for the summaries below) and as a
+sanity check on the upstream scoping.
+
+```{r read-cached-boundaries, message = FALSE, warning=FALSE}
+# standardize the geometry column name to "geometry" - the OpenFileGDB
+# driver renames it to "SHAPE" on write, regardless of the name it had
+# in 01_filter_AquaMatch_Data.Rmd before export
+standardize_geom_col <- function(x) {
+  geom_col <- attr(x, "sf_column")
+  if (geom_col != "geometry") {
+    names(x)[names(x) == geom_col] <- "geometry"
+    st_geometry(x) <- "geometry"
+  }
+  x
+}
+
+HUC4_filtered <- st_read(file.path(filtered_aquamatch_dir, "huc4_filtered.gdb"),
+                         layer = "huc4_filtered", quiet = TRUE) %>%
+  standardize_geom_col()
+states <- st_read(file.path(filtered_aquamatch_dir, "states.gdb"),
+                  layer = "states", quiet = TRUE) %>%
+  standardize_geom_col()
+```
+
+Label each matched site with the HUC4 it falls in and carry that label onto
+the matchups. The printed message confirms that every matched site falls
+inside the regional footprint.
+
+```{r huc4-label-join}
+# add huc info - this is a labeling join (and a sanity check on the
+# upstream regional scoping), not an additional filter: `left = FALSE` drops
+# any matched site that somehow falls outside every regional HUC4, which
+# shouldn't happen given the upstream scoping
+regional_sites <- sites_w_matches %>%
+  st_transform(st_crs(HUC4_filtered)) %>%
+  st_join(HUC4_filtered %>% select(huc4), left = FALSE)
+
+cat(n_distinct(regional_sites$siteSR_id), "of",
+    n_distinct(sites_w_matches$siteSR_id),
+    "matched sites fall within the regional HUC4 footprint",
+    "(should be all of them, since siteSR was already scoped to this",
+    "footprint upstream in 01_filter_AquaMatch_Data.Rmd)\n")
+
+# add sdd info back, carrying along each site's HUC4 label
+regional_sdd <- sdd_match %>%
+  filter(siteSR_id %in% regional_sites$siteSR_id) %>%
+  left_join(
+    regional_sites %>%
+      st_drop_geometry() %>%
+      select(siteSR_id, HUC4 = huc4) %>%
+      # guard against a site sitting exactly on a shared HUC4 boundary,
+      # which could otherwise match more than one polygon in the spatial join
+      distinct(siteSR_id, .keep_all = TRUE),
+    by = "siteSR_id"
+  )
+```
+
+## Screen for heavy rain events between image and field dates
+
+For each candidate match (every SDD/siteSR pair within the 5-day window,
+before any closest-in-time selection) we check to see if there was a heavy single-day rain
+event between the image date and the field (SDD) date (in either order). If
+so, the reflectance and the target likely describe genuinely different water
+states, and the matchup shouldn't be trusted regardless of which one came
+first. NOAA/EPA's "heavy precipitation day" cut of 1 inch (25.4 mm) in 24
+hours, peak single-day intensity within the gap (not cumulative gap-total,
+which would conflate a genuine storm with a longer gap simply having more
+days to accumulate ordinary rain).
+
+This screens **candidates**, before the closest-in-time selection below, not
+after: filtering the already-deduped closest-match dataset would drop an
+observation outright whenever its single nearest candidate image happened to
+be rain-contaminated, even when a perfectly good, only slightly-further-away,
+uncontaminated image was also available in the window. Screening first lets
+closest-in-time selection fall back to that next-best candidate instead.
+
+Needs raw daily gridMET precipitation for every candidate site, over each
+site's full candidate-date range - a broader, coarser need than
+`02c_pull_weather_summaries.Rmd`'s antecedent-window feature fetch (which only
+needs narrow 1-30 day windows ending at each *already-matched* row's date),
+so this is its own fetch rather than a reuse of that cache. Also breaks a
+real circularity: `02c_pull_weather_summaries.Rmd` fetches weather for the
+*output* of this script, so it isn't available yet at this point in the
+pipeline.
+
+```{r rain-check-weather-fetch, message=FALSE, warning=FALSE}
+HEAVY_RAIN_MM <- 25.4  # NOAA/EPA "heavy precipitation day" threshold (1 inch/24hr)
+
+regional_sdd <- regional_sdd %>%
+  mutate(date = as.Date(date),
+         field_date = as.Date(harmonized_local_time),
+         gap_start = pmin(date, field_date),
+         gap_end = pmax(date, field_date))
+
+rain_check_weather_raw_path <- file.path(filtered_aquamatch_dir, "match_gap_precip_raw.feather")
+
+if (file.exists(rain_check_weather_raw_path)) {
+  gap_precip_raw <- read_feather(rain_check_weather_raw_path)
+} else {
+  site_ranges <- regional_sdd %>%
+    left_join(sites %>% select(siteSR_id, WGS84_Latitude, WGS84_Longitude), by = "siteSR_id") %>%
+    summarize(min_date = min(gap_start) - 1, max_date = max(gap_end),
+              lat = first(WGS84_Latitude), lon = first(WGS84_Longitude), .by = siteSR_id)
+  cat(sprintf("[%s] fetching gridMET precip for %s sites\n", format(Sys.time(), "%H:%M:%S"), nrow(site_ranges)))
+
+  fetch_one <- function(i, site_ranges) {
+    row <- site_ranges[i, ]
+    fetch <- function() {
+      pt <- sf::st_as_sf(data.frame(lon = row$lon, lat = row$lat), coords = c("lon", "lat"), crs = 4326)
+      res <- getGridMET(AOI = pt, varname = "pr",
+                        startDate = as.character(row$min_date), endDate = as.character(row$max_date))
+      res$siteSR_id <- row$siteSR_id
+      res
+    }
+    tryCatch(fetch(), error = function(e) {
+      Sys.sleep(2)
+      tryCatch(fetch(), error = function(e2) data.frame(siteSR_id = row$siteSR_id, error = conditionMessage(e2)))
+    })
+  }
+
+  t0 <- Sys.time()
+  cl <- makeCluster(8, type = "PSOCK")
+  clusterEvalQ(cl, { suppressMessages(library(climateR)); suppressMessages(library(sf)) })
+  clusterExport(cl, c("site_ranges", "fetch_one"))
+  results <- parLapply(cl, seq_len(nrow(site_ranges)), fetch_one, site_ranges = site_ranges)
+  stopCluster(cl)
+  cat(sprintf("[%s] fetch took %.1f min\n", format(Sys.time(), "%H:%M:%S"),
+              as.numeric(difftime(Sys.time(), t0, units = "mins"))))
+
+  ok <- Filter(function(x) !"error" %in% names(x), results)
+  failed <- Filter(function(x) "error" %in% names(x), results)
+  cat(sprintf("[%s] succeeded: %s sites, failed: %s sites\n", format(Sys.time(), "%H:%M:%S"), length(ok), length(failed)))
+  if (length(failed) > 0) {
+    write_csv(bind_rows(failed), file.path(filtered_aquamatch_dir, "match_gap_precip_fetch_failures.csv"))
+  }
+
+  gap_precip_raw <- bind_rows(ok) %>% mutate(date = as.Date(date))
+  write_feather(gap_precip_raw, rain_check_weather_raw_path)
+}
+```
+
+For each candidate matchup, find the largest single-day precipitation total
+between the earlier and later of the image and field dates (excluding the
+earlier date itself). Candidates with a day at or above 25.4 mm are removed.
+A `data.table` interval join performs this lookup in one pass over all
+candidates.
+
+```{r rain-check-apply}
+# peak single-day precip strictly BETWEEN gap_start and gap_end (exclusive of
+# gap_start itself, the "day of" whichever event is earlier) - a data.table
+# non-equi (interval) join, not a row-by-row filter (the latter would be an
+# O(n_candidates x n_weather_rows) scan)
+regional_sdd <- regional_sdd %>% mutate(cand_id = row_number())
+candidates_dt <- as.data.table(regional_sdd %>%
+                                 select(cand_id, siteSR_id, gap_start, gap_end))
+wx_dt <- as.data.table(gap_precip_raw %>% select(siteSR_id, date, pr))
+setkey(wx_dt, siteSR_id, date)
+
+joined <- wx_dt[candidates_dt, on = .(siteSR_id, date > gap_start, date <= gap_end),
+                nomatch = NA, allow.cartesian = TRUE]
+gap_max <- joined[, .(gap_max_precip_mm = max(pr, na.rm = TRUE)), by = cand_id]
+gap_max[!is.finite(gap_max_precip_mm), gap_max_precip_mm := 0]
+
+regional_sdd <- regional_sdd %>%
+  left_join(as.data.frame(gap_max), by = "cand_id") %>%
+  mutate(gap_max_precip_mm = coalesce(gap_max_precip_mm, 0))
+
+n_flagged <- sum(regional_sdd$gap_max_precip_mm >= HEAVY_RAIN_MM)
+cat(sprintf("[%s] %s / %s candidate matches flagged for a heavy single-day rain event (>= %.1f mm) between image and field dates - excluded before closest-match selection\n",
+            format(Sys.time(), "%H:%M:%S"), n_flagged, nrow(regional_sdd), HEAVY_RAIN_MM))
+
+regional_sdd <- regional_sdd %>%
+  filter(gap_max_precip_mm < HEAVY_RAIN_MM) %>%
+  select(-field_date, -gap_start, -gap_end, -cand_id, -gap_max_precip_mm)
+```
+
+## QA the data
+
+Make sure we're using the observation closest in time to the measurement.
+This assures we're not using multiple satellites for the same data point in our
+training dataset. We will also export those that are dismissed at this point as a 
+possible additional test set.
+
+```{r closest-obs}
+# grab the observation closes in date to a satellite flyover, from the
+# rain-screened candidate pool built above
+reg_sdd_closest <- regional_sdd %>%
+  arrange(abs(time_diff), mission) %>%
+  slice(1, .by = c("subgroup_id"))
+
+# let's also do an anti-join here of the other observations so that we have an
+# additional validation dataset to play with.
+reg_sdd_additional <- anti_join(regional_sdd, reg_sdd_closest)
+
+write_parquet(reg_sdd_additional,
+              file.path(filtered_aquamatch_dir, "regional_sdd_not_closest.parquet"))
+```
+
+## Visualize data
+
+Let's look at some longer records to do a sanity check to make sure that all
+the filters worked correctly.
+
+```{r site-summary}
+# summarize by site for plotting
+regional_site_summary <- reg_sdd_closest %>%
+  st_as_sf(coords = c("lon", "lat"),
+           crs = "EPSG:4326") %>%
+  summarize(n = n(), .by = c(siteSR_id, geometry)) %>%
+  arrange(n)
+
+# look at some of the records with a lot of data
+regional_long_record <- regional_site_summary %>%
+  filter(n > 100) %>%
+  left_join(., reg_sdd_closest)
+
+ggplot(regional_long_record, aes(x = date, y = harmonized_value)) +
+  geom_point() +
+  facet_wrap(siteSR_id ~ .) +
+  theme_bw()
+```
+
+Map the number of final matchups at each site, overlaid on the regional
+HUC4 boundaries.
+
+```{r plot-sites-spatial}
+tm_shape(HUC4_filtered) +
+  tm_shape(states %>%
+             st_transform(st_crs(HUC4_filtered))) +
+  tm_polygons() +
+  tm_shape(HUC4_filtered) +
+  tm_polygons(fill_alpha = 0) +
+  tm_shape(regional_site_summary %>%
+             st_transform(st_crs(HUC4_filtered))) +
+  tm_dots("n",
+          fill.scale = tm_scale_continuous(values = "viridis"))
+```
+
+Summarize the final matchups by HUC4. Basins with no matchups are outlined
+but left unfilled.
+
+```{r plot-huc-summary}
+regional_huc_summary <- reg_sdd_closest %>%
+  st_as_sf(coords = c("lon", "lat"),
+           crs = "EPSG:4326") %>%
+  st_transform(., st_crs(HUC4_filtered)) %>%
+  st_join(HUC4_filtered, .) %>%
+  summarize(n = sum(!is.na(siteSR_id)), .by = c(huc4, geometry))
+
+
+tm_shape(HUC4_filtered) +
+  tm_shape(states %>%
+             st_transform(st_crs(HUC4_filtered))) +
+  tm_polygons() +
+  tm_shape(HUC4_filtered) +
+  tm_polygons(fill_alpha = 0) +
+  # drop 0-count HUC4s so they're left uncolored (outline only) instead of
+  # taking the low end of the viridis scale
+  tm_shape(regional_huc_summary %>% filter(n > 0)) +
+  tm_polygons("n",
+              fill.scale = tm_scale_continuous(values = "viridis"),
+              fill_alpha = 0.5)
+
+```
+
+## Data Retention Summary
+
+How much data survived each filtering step, from the raw nationwide SDD and
+siteSR inputs down to the final matched, closest-observation training set?
+`01_filter_AquaMatch_Data.Rmd` logged row/site counts through its SDD and
+siteSR filtering steps (`row_loss_log_01.csv`); we append this script's
+matching and closest-observation QA steps here. Every step is already
+scoped to this project's 6-state HUC4 region except each pipeline's first
+("raw") row.
+
+```{r row-log-combine}
+row_log <- read_csv(file.path(filtered_aquamatch_dir, "row_loss_log_01.csv"),
+                    show_col_types = FALSE) %>%
+  bind_rows(
+    tibble(pipeline = "matched", step = "0_5day_window_match",
+           n_rows = nrow(sdd_match), n_sites = n_distinct(sdd_match$siteSR_id)),
+    # regional_sdd was reassigned to the rain-screened candidate pool above
+    tibble(pipeline = "matched", step = "1_heavy_rain_screen",
+           n_rows = nrow(regional_sdd), n_sites = n_distinct(regional_sdd$siteSR_id)),
+    tibble(pipeline = "matched", step = "2_closest_observation_final",
+           n_rows = nrow(reg_sdd_closest), n_sites = n_distinct(reg_sdd_closest$siteSR_id))
+  )
+
+write_csv(row_log, file.path(filtered_aquamatch_dir, "row_loss_log.csv"))
+```
+
+Tabulate the log: for each pipeline (SDD, siteSR, and matched), the rows
+and sites remaining after each step, as a percentage of the previous step
+and of the pipeline's starting count.
+
+```{r row-log-table}
+row_log_display <- row_log %>%
+  mutate(pipeline = factor(pipeline, levels = c("SDD", "siteSR", "matched"))) %>%
+  arrange(pipeline, step) %>%
+  group_by(pipeline) %>%
+  mutate(step_label = step %>%
+           str_remove("^[0-9]+[a-z]?_") %>%
+           str_replace_all("_", " ") %>%
+           str_to_sentence(),
+         pct_of_raw = round(100 * n_rows / first(n_rows), 1),
+         pct_of_previous = round(100 * n_rows / lag(n_rows), 1)) %>%
+  ungroup() %>%
+  select(pipeline, step_label, n_rows, n_sites, pct_of_previous, pct_of_raw)
+
+knitr::kable(row_log_display,
+             col.names = c("Pipeline", "Step", "Total Rows", "Total Sites",
+                           "% of previous step retained", "% of pipeline's first step retained"),
+             format.args = list(big.mark = ",")) %>%
+  kableExtra::kable_styling(full_width = FALSE) %>%
+  # merge consecutive same-pipeline cells into one spanning cell, so the
+  # table reads as three grouped blocks (SDD/siteSR/matched) rather than a
+  # flat list repeating the pipeline name on every row
+  kableExtra::collapse_rows(columns = 1, valign = "top")
+```
+
+The same retention counts as a bar chart, one panel per pipeline, with steps
+ordered top to bottom.
+
+```{r row-log-figure, fig.height=8}
+row_log_display %>%
+  # fct_inorder() alone would put the first (largest) step at the bottom
+  # after coord_flip() - reverse it so bars read largest-to-smallest top-down
+  mutate(step_label = fct_rev(fct_inorder(step_label))) %>%
+  ggplot(aes(x = step_label, y = n_rows)) +
+  geom_col() +
+  geom_text(aes(label = scales::comma(n_rows)), hjust = -0.05, size = 3) +
+  facet_wrap(~ pipeline, scales = "free", ncol = 1) +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.3))) +
+  labs(x = NULL, y = "rows remaining",
+       title = "Data retention through the filtering pipeline") +
+  ggthemes::theme_few() +
+  theme(legend.position = "none")
+```
+
+## Export data
+
+Write the final modeling matchups: one closest-in-time, rain-screened
+image per SDD observation. This file is the input to the site
+characteristics and weather pulls and to
+[03 · Split data](03_split_data.ipynb).
+
+```{r export}
+write_parquet(reg_sdd_closest,
+              file.path(filtered_aquamatch_dir, 
+                        "filtered_regional_sdd.parquet"))
+```

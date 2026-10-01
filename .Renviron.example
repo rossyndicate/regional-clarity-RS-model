@@ -1,0 +1,6 @@
+# Copy this file to .Renviron (untracked) and fill in real values.
+# R loads .Renviron automatically at session start; access values with Sys.getenv("KEY_NAME").
+# This workflow requires an EDI API key and is referenced in the pipeline as "EDI_API_key".
+#
+#
+# EDI_API_key="your-value-here"

@@ -1,0 +1,11 @@
+---
+pagetitle: "Model card"
+# The model card lives with the model, in the folder pushed to the Hugging
+# Face Hub; edit it there. Its level-1 heading becomes this page's title and
+# its sections become the page's top-level headings.
+shift-heading-level-by: -1
+# The card's Hugging Face metadata (license: mit) would otherwise add a "Reuse" footer.
+appendix-style: none
+---
+
+{{< include regional_clarity/xg_models/v3_production/README.md >}}

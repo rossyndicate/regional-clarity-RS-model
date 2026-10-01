@@ -1,0 +1,64 @@
+---
+title: "Intermountain West Regional Clarity Remote Sensing Model"
+subtitle: "Workflow for estimating Secchi disc depth from Landsat across the intermountain West"
+toc: false
+---
+
+<!-- Zenodo DOI badge: after the first GitHub release is archived, replace XXXXXXX with the
+     record number of the *concept* DOI and uncomment. Keep "How to cite" and "Data sources"
+     in sync with README.md and the model card.
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.XXXXXXX.svg)](https://doi.org/10.5281/zenodo.XXXXXXX)
+-->
+
+This site presents the workflow behind the regional Secchi disc depth (SDD) model, which is built from in situ SDD matched to Landsat Collection 2 surface reflectance. Both come from the AquaMatch data products on the Environmental Data Initiative (EDI) repository (see [Data sources](#data-sources)). Each page is one step of the workflow, shown with its code and outputs. Every page opens with a header giving its purpose, inputs, outputs, and the previous and next steps.
+
+The [model card](model_card.qmd) summarizes the production model: intended use, training data, performance, applicability checks, and limitations.
+
+Data preparation and application run in R. Modeling runs in Python notebooks that share the modules in `regional_clarity/python/`. Arrows are labeled with the main file each step hands to the next.
+
+```{mermaid}
+%%| file: pipeline_diagram.mmd
+```
+
+| Step | Page | What it does |
+|---|---|---|
+| 00 | [Download AquaMatch data](regional_clarity/00_download_AquaMatch_data.Rmd) | Download AquaMatch SDD and siteSR; apply Landsat 7-referenced handoffs. |
+| 01 | [Filter AquaMatch data](regional_clarity/01_filter_AquaMatch_Data.Rmd) | Scope to the 6-state HUC4 region; SDD QC and RANSAC; siteSR scene QA and band RANSAC. |
+| 02a | [Make matchups](regional_clarity/02a_make_matches.Rmd) | 5-day matchups, rain-event filter, closest image per sample. |
+| 02b | [Pull site characteristics](regional_clarity/02b_pull_site_characteristics.Rmd) | Elevation and LakeCat catchment features per site. |
+| 02c | [Pull weather summaries](regional_clarity/02c_pull_weather_summaries.Rmd) | gridMET antecedent-weather features (1/3/7/30-day windows). |
+| 03 | [Split data](regional_clarity/03_split_data.ipynb) | Join features; fixed HUC8 holdout and CV folds. |
+| 04 | [Make models](regional_clarity/04_make_models.ipynb) | Per-seed feature selection, tuning, and 4-fold XGBoost (10 seeds × 4 folds). |
+| 05 | [Evaluate ensemble](regional_clarity/05_evaluate_ensemble.ipynb) | Ensemble holdout performance and SHAP. |
+| 06 | [Test-set sensitivity](regional_clarity/06_test_set_sensitivity.ipynb) | Holdout RMSE across 16 holdout draws. |
+| 07 | [Regional application](regional_clarity/07_regional_application.Rmd) | Apply the ensemble at in situ SDD locations, with training-domain and AOA checks. |
+
+Source code: [rossyndicate/regional-clarity-RS-model](https://github.com/rossyndicate/regional-clarity-RS-model).
+
+## How to cite
+
+If you use this model or code, please cite this repository by its Zenodo DOI, and cite the data products listed under [Data sources](#data-sources).
+
+> Steele, B.G. (YYYY). *Intermountain West Regional Clarity Remote Sensing Model* (vX.Y.Z) [Software]. Zenodo. <https://doi.org/10.5281/zenodo.XXXXXXX>
+
+Zenodo assigns a DOI to each GitHub release, plus a concept DOI that always resolves to the latest release. The citation above uses the concept DOI. To cite the exact release you used, take that release's version DOI from Zenodo instead.
+
+## Data sources
+
+All in situ and remote sensing inputs come from three AquaMatch data packages on EDI. [Step 00](regional_clarity/00_download_AquaMatch_data.Rmd) downloads them with the [`AquaMatchr`](https://github.com/AquaSat/AquaMatchr) R package (Brousil & Ross 2026), which requires an EDI account and API key. The production model was built from revision 1 of each package.
+
+| EDI package | Product | Used for |
+|---|---|---|
+| [`edi.1856.1`](https://doi.org/10.6073/pasta/542a305e8484ae5abc33881bd7761308) | AquaMatch Secchi disc depth | Target variable (in situ SDD) |
+| [`edi.2254.1`](https://doi.org/10.6073/pasta/f85622d6d32ef7fe6cff8d63c3b947c9) | siteSR | Landsat surface reflectance and temperature at sampling sites, scene-level metadata, and the site list |
+| [`edi.2114.1`](https://doi.org/10.6073/pasta/941f3cb046f5e7fbe04d5811989ed810) | lakeSR | Cross-sensor handoff coefficients used to harmonize all Landsat missions to Landsat 7 |
+
+Recommended citations, as provided by EDI:
+
+- De La Torre, J., B.G. Steele, M.R. Brousil, M.F. Meyer, K. Willi, and M.R. Ross. 2025. AquaMatch Secchi Disk Depth Data from Water Quality Portal: ~1970-2024 ver 1. Environmental Data Initiative. <https://doi.org/10.6073/pasta/542a305e8484ae5abc33881bd7761308>
+- Steele, B.G., M.R. Brousil, K.R. Willi, M.F. Meyer, and M.R. Ross. 2026. SiteSR: AquaMatch Landsat Collection 2 surface reflectance and surface temperature datasets for remote-sensing visible Water Quality Portal and National Water Information System sites in the United States and Territories, 1983-2024 ver 1. Environmental Data Initiative. <https://doi.org/10.6073/pasta/f85622d6d32ef7fe6cff8d63c3b947c9>
+- Steele, B.G., M.R. Brousil, K.R. Willi, M.F. Meyer, and M.R. Ross. 2026. lakeSR: AquaMatch Landsat Collection 2 surface reflectance and surface temperature datasets for centrally-located points of water bodies greater than 1 hectare in the United States and territories, 1983-2024 ver 1. Environmental Data Initiative. <https://doi.org/10.6073/pasta/941f3cb046f5e7fbe04d5811989ed810>
+
+Access software:
+
+- Brousil, M., and M. Ross. 2026. AquaMatchr: Download, Join, and Analyze AquaMatch Data Products. R package version 0.0.0.9000. <https://github.com/AquaSat/AquaMatchr>

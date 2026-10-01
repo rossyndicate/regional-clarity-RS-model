@@ -1,0 +1,75 @@
+project:
+  type: website
+  output-dir: _site
+  # the Rmds use repository-root-relative paths (e.g. "regional_clarity/aquamatch_files/...")
+  execute-dir: project
+  render:
+    - index.qmd
+    - model_card.qmd
+    - regional_clarity/00_download_AquaMatch_data.Rmd
+    - regional_clarity/01_filter_AquaMatch_Data.Rmd
+    - regional_clarity/02a_make_matches.Rmd
+    - regional_clarity/02b_pull_site_characteristics.Rmd
+    - regional_clarity/02c_pull_weather_summaries.Rmd
+    - regional_clarity/03_split_data.ipynb
+    - regional_clarity/04_make_models.ipynb
+    - regional_clarity/05_evaluate_ensemble.ipynb
+    - regional_clarity/06_test_set_sensitivity.ipynb
+    - regional_clarity/07_regional_application.Rmd
+
+# Rmds execute once, then reuse the stored results in _freeze/ until their
+# source changes. Notebooks are never executed: their saved outputs are used.
+execute:
+  freeze: auto
+
+website:
+  title: "Intermountain West Regional Clarity Remote Sensing Model"
+  site-url: https://rossyndicate.github.io/regional-clarity-RS-model/
+  repo-url: https://github.com/rossyndicate/regional-clarity-RS-model
+  repo-branch: main
+  repo-actions: [source]
+  page-navigation: true
+  sidebar:
+    style: docked
+    search: true
+    contents:
+      - text: "Overview"
+        href: index.qmd
+      - text: "Model card"
+        href: model_card.qmd
+      - section: "Data preparation (R)"
+        contents:
+          - text: "00 · Download AquaMatch data"
+            href: regional_clarity/00_download_AquaMatch_data.Rmd
+          - text: "01 · Filter AquaMatch data"
+            href: regional_clarity/01_filter_AquaMatch_Data.Rmd
+          - text: "02a · Make matchups"
+            href: regional_clarity/02a_make_matches.Rmd
+          - text: "02b · Pull site characteristics"
+            href: regional_clarity/02b_pull_site_characteristics.Rmd
+          - text: "02c · Pull weather summaries"
+            href: regional_clarity/02c_pull_weather_summaries.Rmd
+      - section: "Modeling (Python)"
+        contents:
+          - text: "03 · Split data for modeling"
+            href: regional_clarity/03_split_data.ipynb
+          - text: "04 · Make models"
+            href: regional_clarity/04_make_models.ipynb
+          - text: "05 · Evaluate the ensemble"
+            href: regional_clarity/05_evaluate_ensemble.ipynb
+          - text: "06 · Evaluate test-set sensitivity"
+            href: regional_clarity/06_test_set_sensitivity.ipynb
+      - section: "Application (R)"
+        contents:
+          - text: "07 · Regional application of the ensemble"
+            href: regional_clarity/07_regional_application.Rmd
+
+format:
+  html:
+    theme: cosmo
+    toc: true
+    toc-depth: 3
+    code-fold: true
+    code-tools: true
+    mermaid:
+      theme: neutral

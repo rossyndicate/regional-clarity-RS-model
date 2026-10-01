@@ -3,6 +3,12 @@
 .RData
 .Ruserdata
 
+# local secrets/credentials - never commit this file
+.Renviron
+
+# aquamatch files directory
+aquamatch_files/
+
 # hypertune folder
 regional_clarity/xg_models/hypertune/
 
@@ -10,3 +16,19 @@ regional_clarity/xg_models/hypertune/
 **.DS_Store
 **.csv
 **.feather
+**.parquet
+**.rds
+**.png
+**/__pycache__/
+/.quarto/
+**/*.quarto_ipynb
+
+# ...except Quarto's frozen Rmd results, which the site build needs
+!_freeze/**/*.png
+
+# rendered Quarto site (published to the gh-pages branch, not tracked on main)
+/_site/
+
+
+# Python virtual environment (see README: Python environment)
+/.venv/

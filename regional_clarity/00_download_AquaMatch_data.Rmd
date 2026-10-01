@@ -1,0 +1,133 @@
+---
+title: "Download AquaMatch Data"
+author: "B Steele, Colorado State University, ROSSyndicate"
+date: "last updated Sept 14, 2026"
+---
+
+**Pipeline step 00 · R · run from `regional_clarity/` · chunks are `eval = FALSE`; run by hand only when AquaMatch changes upstream**
+
+- **Purpose:** Download the AquaMatch Secchi disc depth (SDD) and siteSR data, stack siteSR across Landsat missions, and apply the Gardner handoff coefficients referenced to Landsat 7.
+- **Inputs:** AquaMatch via `AquaMatchr` (needs `EDI_API_key` in `.Renviron`).
+- **Outputs:** `aquamatch_files/downloads/`: `sdd_cache.parquet`, `siteSR_DSWE1_LS7corr.parquet`, `sceneMetadata_Landsat*.csv`, site metadata and handoff CSVs.
+- **Next:** [01 · Filter AquaMatch data](01_filter_AquaMatch_Data.Rmd)
+
+# Background
+
+This step downloads the AquaSat SDD and siteSR data and applies the Gardner-style
+handoff coefficients for use in a modeling workflow to estimate SDD across the 
+intermountain west. Only run this script if there have been upstream changes
+to the AquaMatch dataset, since downloading files takes some time to complete.
+
+Knitting this file will not result in any download, as all chunks are set to
+`eval = FALSE`.
+
+## Setup
+
+Load the packages used in this step. `AquaMatchr` handles all communication
+with the AquaMatch data packages on EDI; `arrow` and `data.table` handle the
+large parquet and feather files it produces.
+
+```{r libraries, eval=FALSE}
+# load libraries
+library(AquaMatchr) # if install needed: remotes::install_github(repo = "AquaSat/AquaMatchr")
+library(data.table)
+library(arrow)
+library(tidyverse)
+```
+
+Authenticate with the Environmental Data Initiative (EDI) repository before
+requesting any files. `AquaMatchr` can fail to prompt for credentials on its
+own, so this logs in explicitly using the `EDI_API_key` stored in `.Renviron`.
+
+```{r edi-login, eval=FALSE}
+# login to EDI - this is a work around for error popping up in AquaMatchr
+# requires EDIutils, which is required by AquaMatchr so no need to import
+EDIutils::login(key = Sys.getenv('EDI_API_key'))
+```
+
+# Download AquaMatch data
+
+Set a download location for the files. Everything downloaded or built in
+this step is written to `aquamatch_files/downloads/`, which is the input
+directory for [01 · Filter AquaMatch data](01_filter_AquaMatch_Data.Rmd).
+
+```{r aquamatch-dir, eval=FALSE}
+# note location for file storage when downloading via AquaMatchr
+aquamatch_dir <- "aquamatch_files/downloads"
+dir.create(aquamatch_dir, recursive = T)
+```
+
+Use `download_parameters()` to retrieve the newest version of the AquaMatch
+Secchi disc depth (SDD) dataset, and cache it locally as a parquet file so
+later steps can read it without re-downloading.
+
+```{r download-data, eval=FALSE}
+# use AquaMatchr for data gathering
+sdd <- download_parameters(parameters = "sdd", 
+                           version = "newest")
+# get it out of a list
+sdd <- sdd[["sdd"]]
+write_dataset(dataset = sdd, 
+              path = file.path(aquamatch_dir, "sdd_cache.parquet"), 
+              format = "parquet")
+rm(sdd)
+```
+
+Next, download the siteSR data: the Landsat surface reflectance summaries
+extracted at each AquaMatch site. These arrive as separate files per Landsat
+mission. The algal mask is not applied here.
+
+```{r download-siteSR, eval=FALSE}
+download_siteSR(save_location = aquamatch_dir, 
+                version = "newest", 
+                algal_mask = FALSE)
+```
+
+Stack the per-mission siteSR files into a single dataset so that all Landsat
+missions share one table, saved as a feather file.
+
+```{r siteSR-stack, eval=FALSE}
+build_sr(which_sr = "siteSR",
+         sr_location = aquamatch_dir,
+         algal_mask = FALSE,
+         save = TRUE, 
+         save_location = file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.feather")
+)
+
+```
+
+Atmospheric correction and differing sensor specifications across Landsat missions
+can create artificial patterns in the surface reflectance product, so each
+mission is harmonized to a common reference before modeling. This chunk
+converts the stacked feather file to parquet, then applies the Gardner-style
+polynomial handoff coefficients that AquaMatch provides, using Landsat 7 as
+the reference sensor. The result, `siteSR_DSWE1_LS7corr.parquet`, is the
+reflectance input to the rest of the pipeline.
+
+```{r apply-handsoff, eval=FALSE}
+# workaround for feather/parquet issue
+open_dataset(file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.feather"), 
+             format = "feather") %>% 
+  write_dataset(dataset = .,  
+                path = file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.parquet"),
+                format = "parquet")
+
+# and apply handoffs
+apply_handoffs(
+  input_path = file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.parquet"),
+  handoff_path = list.files(aquamatch_dir, full.names = T)[grepl("handoff", list.files(aquamatch_dir))],
+  correction_method = "Gardner_poly",
+  sat_target = "LS7",
+  algal_mask = "FALSE",
+  save_location = "aquamatch_files/downloads/siteSR_DSWE1_LS7corr.parquet"
+)
+```
+
+Finally, download the scene-level metadata for each Landsat mission (e.g.,
+cloud cover, sun angle, and acquisition time). [01](01_filter_AquaMatch_Data.Rmd)
+uses these fields to filter the reflectance data.
+
+```{r sitesr-scene, eval=FALSE}
+download_sceneMetadata(save_location = aquamatch_dir, product = "siteSR")
+```
+

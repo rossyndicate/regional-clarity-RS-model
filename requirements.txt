@@ -1,0 +1,21 @@
+# Python dependencies for the modeling notebooks (03-06) and regional_clarity/python/.
+# Direct dependencies only, pinned to the versions the production run used.
+# requirements-lock.txt pins the full dependency tree; install from that for an exact rebuild.
+# Python 3.11 (3.11.16 used for the production run).
+numpy==2.4.6
+pandas==3.0.5
+pyarrow==25.0.0
+geopandas==1.1.4
+pyogrio==0.13.0
+shapely==2.1.2
+pyproj==3.7.2
+matplotlib==3.11.1
+xgboost==3.2.0
+lightgbm==4.7.0
+shap==0.51.0
+scikit-learn==1.9.1
+scipy==1.16.3
+ipykernel==7.3.0
+nbclient==0.11.0
+nbformat==5.11.1
+nbconvert==7.17.1

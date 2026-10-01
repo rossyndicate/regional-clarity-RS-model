@@ -1,0 +1,490 @@
+---
+title: "Manuscript Tables and Figures"
+author: "B Steele, Colorado State University, ROSSyndicate"
+date: "last updated Sep 24, 2026"
+output:
+  html_document:
+    fig_retina: 1
+---
+
+**Manuscript · R · run from the repository root**
+
+- **Purpose:** Build the manuscript tables and figures from the workflow outputs.
+- **Inputs:** `aquamatch_files/application/`, `aquamatch_files/` matchup files and row-loss logs, `xg_models/v3_production/`.
+- **Outputs:** `asv2_manuscript/output/`: table CSVs and figure PNGs.
+- **Previous:** [07 · Regional application](../07_regional_application.Rmd)
+
+Tables and figures for the regional Secchi disc depth manuscript, built from
+the outputs of the numbered workflow scripts. Each table is also written as a
+.csv to `regional_clarity/asv2_manuscript/` for pasting into the manuscript.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r libraries, message = FALSE, warning = FALSE}
+library(arrow)
+library(jsonlite)
+library(tidyverse)
+
+filtered_aquamatch_dir <- "regional_clarity/aquamatch_files"
+models_dir <- "regional_clarity/xg_models/v3_production"
+manuscript_dir <- "regional_clarity/asv2_manuscript/output"
+ensemble_seeds <- 601:610
+dir.create(manuscript_dir, showWarnings = FALSE)
+```
+
+
+## Figures
+
+### Figure 3: holdout performance, feature attribution, application record
+
+```{r application-load}
+application_dir <- file.path(filtered_aquamatch_dir, "application")
+
+filter_steps <- read_csv(file.path(application_dir, "application_filter_steps.csv"), show_col_types = FALSE)
+rs_estimates <- read_parquet(file.path(application_dir, "application_rs_estimates.parquet"))
+insitu_days <- read_parquet(file.path(application_dir, "application_insitu_location_days.parquet"))
+superseded_validation <- read_csv(file.path(application_dir, "superseded_validation.csv"), show_col_types = FALSE) %>%
+  filter(sites == "all sites")
+aoa_params <- read_json(file.path(application_dir, "aoa_parameters.json"))
+
+# remote sensing estimates on days with no in situ observation at that location
+rs_new <- anti_join(rs_estimates, insitu_days, by = c("location_id", "date"))
+combined_days <- bind_rows(select(insitu_days, location_id, date),
+                           select(rs_estimates, location_id, date)) %>%
+  distinct()
+
+per_location <- full_join(count(insitu_days, location_id, name = "n_insitu"),
+                          count(rs_new, location_id, name = "n_rs_new"),
+                          by = "location_id") %>%
+  mutate(across(c(n_insitu, n_rs_new), ~ replace_na(.x, 0L)))
+
+location_years <- function(df) nrow(distinct(df, location_id, year = year(date)))
+
+application_summary <- list(
+  n_insitu_locations = n_distinct(insitu_days$location_id),
+  n_insitu_days = nrow(insitu_days),
+  n_rs_locations = n_distinct(rs_estimates$location_id),
+  n_rs_days = nrow(rs_estimates),
+  n_rs_new = nrow(rs_new),
+  n_combined = nrow(combined_days),
+  fold_increase = nrow(combined_days) / nrow(insitu_days),
+  insitu_location_years = location_years(insitu_days),
+  combined_location_years = location_years(combined_days),
+  # among locations with at least one remote sensing estimate
+  median_location_multiplier = per_location %>%
+    filter(n_rs_new > 0) %>%
+    summarise(m = median((n_insitu + n_rs_new) / pmax(n_insitu, 1))) %>%
+    pull(m),
+  season_window = as.Date(unlist(aoa_params$season_window_doy) - 1, origin = "2021-01-01"),
+  superseded_share_applicable = superseded_validation$n[superseded_validation$group == "passes all checks"] /
+    superseded_validation$n[superseded_validation$group == "all superseded"]
+)
+str(application_summary)
+```
+
+Filtering from siteSR observations to usable SDD estimates
+
+```{r application-table}
+application_table <- filter_steps %>%
+  select(Step = step, `Location-days` = location_days, Locations = locations) %>%
+  bind_rows(tibble(Step = c("In situ SDD (for comparison)",
+                            "Remote sensing estimates on days without in situ SDD",
+                            "Combined in situ + remote sensing"),
+                   `Location-days` = c(application_summary$n_insitu_days,
+                                       application_summary$n_rs_new,
+                                       application_summary$n_combined),
+                   Locations = c(application_summary$n_insitu_locations,
+                                 n_distinct(rs_new$location_id),
+                                 n_distinct(combined_days$location_id))))
+
+write_csv(application_table, file.path(manuscript_dir, "table_application_filtering.csv"))
+
+knitr::kable(application_table,
+             caption = paste("Landsat observations at regional locations with quality-controlled in situ SDD,",
+                             "counted as distinct location-days after each filtering step required for a",
+                             "trustworthy SDD estimate, compared with the in situ record at the same locations."),
+             format.args = list(big.mark = ","))
+```
+
+
+
+Panel a: the production ensemble's holdout predictions, read from each
+seed's `holdout_predictions.parquet` and averaged per (site, date) exactly as
+in `05_evaluate_ensemble.ipynb` (across all 40 members and any same-day
+matchups from different missions). Metrics match `python/metrics.py` (R² is
+the squared Pearson correlation) and go in the caption rather than the plot.
+Panel b: ensemble-mean |SHAP| over the unanimous core features, written by
+`05_evaluate_ensemble.ipynb` to `ensemble_mean_abs_shap.csv`.
+
+Panel c: How many more SDD observations does remote sensing provide at the locations
+where in situ SDD is already collected? `07_regional_application.Rmd` applies
+the production ensemble to every Landsat observation at every regional
+location with QC'd in situ SDD, then keeps only estimates that pass the same
+checks that would be needed to trust them: siteSR QA identical to the
+training data, a Landsat mission represented in training, the seasonal window
+of the training matchups, complete model inputs, every input within the
+training range, the model's area of applicability (AOA; Meyer & Pebesma
+2021), and a physically plausible estimate. Everything here is counted in
+*location-days*: distinct (physical location, date) pairs, where sites
+within 100 m on the same waterbody are one location. That way neither a
+station listed under two identifiers nor overlapping Landsat paths on the
+same day inflates either side of the comparison.
+
+
+```{r figure-3-data}
+holdout_preds <- map(ensemble_seeds, \(s) {
+  read_parquet(file.path(models_dir, paste0("seed", s), "holdout_predictions.parquet"))
+}) %>%
+  list_rbind() %>%
+  summarise(obs = first(y), pred = mean(pred), .by = c(siteSR_id, date))
+
+holdout_metrics <- holdout_preds %>%
+  summarise(n = n(),
+            rmse = sqrt(mean((obs - pred)^2)),
+            mae = mean(abs(obs - pred)),
+            bias = mean(pred - obs),
+            r2 = cor(obs, pred)^2)
+
+mean_abs_shap <- read_csv(file.path(models_dir, "ensemble_mean_abs_shap.csv"),
+                          show_col_types = FALSE)
+
+feature_labels <- c(
+  BG = "Blue:green ratio",
+  green_corr7 = "Green reflectance",
+  BR = "Blue:red ratio",
+  MNDWI = "MNDWI",
+  fai = "Floating algae index",
+  catchment_area_sqkm = "Catchment area",
+  NR = "NIR:red ratio",
+  srad_Wm2_prev30 = "Solar radiation, 30-d mean",
+  srad_Wm2_prev7 = "Solar radiation, 7-d mean",
+  srad_Wm2_prev1 = "Solar radiation, previous day",
+  tmean_degC_prev30 = "Air temperature, 30-d mean",
+  tmax_degC_prev30 = "Air temperature, 30-d max",
+  nir_corr7 = "NIR reflectance",
+  temp_corr7 = "Surface temperature",
+  NDVI = "NDVI",
+  NDWI = "NDWI",
+  NDSSI = "NDSSI",
+  atm_corr_LaSRC = "Atmospheric correction (LaSRC)",
+  shore_flag = "Near-shore flag",
+  pct_impervious_2006 = "Catchment impervious (%)",
+  pct_wetland_2006 = "Catchment wetland (%)"
+)
+category_labels <- c(optical = "Optical", site = "Site/catchment", weather = "Antecedent weather")
+category_colors <- c("Optical" = "#002EA3", "Site/catchment" = "#E70870", "Antecedent weather" = "#256BF5")
+
+stopifnot("SHAP feature missing a display label" = all(mean_abs_shap$feature %in% names(feature_labels)))
+
+mean_abs_shap <- mean_abs_shap %>%
+  mutate(label = fct_reorder(feature_labels[feature], mean_abs_shap),
+         Category = factor(category_labels[category], levels = category_labels))
+
+category_share <- mean_abs_shap %>%
+  summarise(share = sum(mean_abs_shap), .by = Category) %>%
+  mutate(share = 100 * share / sum(share))
+```
+
+```{r figure-3, fig.width = 10, fig.height = 9}
+axis_max <- ceiling(max(holdout_preds$obs, holdout_preds$pred))
+
+pred_obs <- ggplot(holdout_preds, aes(obs, pred)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
+  geom_point(alpha = 0.3, size = 1, color = "#002EA3") +
+  coord_equal(xlim = c(0, axis_max), ylim = c(0, axis_max), expand = FALSE) +
+  labs(x = "Observed Secchi disc depth (m)", y = "Predicted Secchi disc depth (m)") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank())
+
+shap_bars <- ggplot(mean_abs_shap, aes(mean_abs_shap, label, fill = Category)) +
+  geom_col(width = 0.75) +
+  scale_fill_manual(values = category_colors, name = NULL) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.05))) +
+  labs(x = "Mean |SHAP| (m)", y = NULL) +
+  theme_bw() +
+  theme(panel.grid.major.y = element_blank(),
+        panel.grid.minor = element_blank(),
+        axis.text.y = element_text(size = 10),
+        legend.position = "inside",
+        legend.position.inside = c(0.98, 0.02),
+        legend.justification = c(1, 0),
+        legend.background = element_rect(fill = "white", color = "grey80"))
+
+annual <- bind_rows(insitu_days %>% mutate(source = "In situ"),
+                    rs_new %>% mutate(source = "Remote sensing (no same-day in situ)")) %>%
+  count(source, year = year(date))
+
+annual_panel <- ggplot(annual, aes(year, n, fill = source)) +
+  geom_col(width = 0.85) +
+  scale_fill_manual(values = c("In situ" = "#E70870", "Remote sensing (no same-day in situ)" = "#002EA3"),
+                    name = NULL) +
+  scale_y_continuous(labels = scales::label_comma(), expand = expansion(mult = c(0, 0.05))) +
+  labs(x = NULL, y = "Location-days") +
+  theme_bw() +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "inside",
+        legend.position.inside = c(0.02, 0.98),
+        legend.justification = c(0, 1),
+        legend.background = element_rect(fill = "white", color = "grey80"))
+
+figure_3 <- patchwork::wrap_plots(pred_obs, shap_bars, annual_panel,
+                                  design = "AB\nCC", widths = c(1, 1.1), heights = c(1.2, 1)) +
+  patchwork::plot_annotation(tag_levels = "a")
+
+ggsave(file.path(manuscript_dir, "figure_3.png"), figure_3, width = 10, height = 9, dpi = 300)
+
+figure_3
+```
+
+**Figure 3.** (a) Predicted versus observed Secchi disc depth (SDD) for the
+held-out test set (n = `r format(holdout_metrics$n, big.mark = ",")` site-date
+matchups), where each prediction is the mean of the 40-member ensemble; the
+dashed line is 1:1. RMSE = `r sprintf("%.2f", holdout_metrics$rmse)` m,
+MAE = `r sprintf("%.2f", holdout_metrics$mae)` m,
+bias = `r sprintf("%+.2f", holdout_metrics$bias)` m,
+R² = `r sprintf("%.2f", holdout_metrics$r2)`. (b) Mean absolute SHAP value
+for each of the `r nrow(mean_abs_shap)` features selected by all ten ensemble
+seeds, averaged across the 40-member ensemble and the test set, colored by
+feature category: optical (dark blue;
+`r sprintf("%.0f", category_share$share[category_share$Category == "Optical"])`%
+of total attribution), site/catchment (pink;
+`r sprintf("%.0f", category_share$share[category_share$Category == "Site/catchment"])`%),
+and antecedent weather (light blue;
+`r sprintf("%.0f", category_share$share[category_share$Category == "Antecedent weather"])`%). (c) Annual SDD location-days at the
+`r format(application_summary$n_insitu_locations, big.mark = ",")` regional
+locations with quality-controlled in situ SDD: in situ observations (pink) and
+remote sensing estimates on days without a same-day in situ observation (dark
+blue; n = `r format(application_summary$n_rs_new, big.mark = ",")`). Remote
+sensing estimates are those passing siteSR QA, the seasonal window of the
+training matchups, complete model inputs, the training range of every input,
+the model's area of applicability (Meyer & Pebesma 2021), and a physically
+plausible estimate.
+
+## Supplemental 
+
+### Supplemental Table 1: Data reduction through the filtering pipeline
+
+SDD and siteSR counts come from the row log written by
+`01_filter_AquaMatch_Data.Rmd`. Matched counts are taken directly from the
+parquet outputs of `02a_make_matches.Rmd` so they always reflect the matchup
+data the models were trained on. The rain-screened candidate pool is the
+final closest-observation set plus the non-closest candidates set aside after
+closest-in-time selection.
+
+```{r data-reduction-counts}
+row_log_01 <- read_csv(file.path(filtered_aquamatch_dir, "row_loss_log_01.csv"),
+                       show_col_types = FALSE)
+
+match_5d <- read_parquet(file.path(filtered_aquamatch_dir, "sdd_regional_siteSR_matchups_5d.parquet"))
+match_closest <- read_parquet(file.path(filtered_aquamatch_dir, "filtered_regional_sdd.parquet"))
+match_not_closest <- read_parquet(file.path(filtered_aquamatch_dir, "regional_sdd_not_closest.parquet"))
+match_rain_screened <- bind_rows(match_closest, match_not_closest)
+
+row_log_matched <- tibble(
+  pipeline = "matched",
+  step = c("0_5day_window_match", "1_heavy_rain_screen", "2_closest_observation_final"),
+  n_rows = c(nrow(match_5d), nrow(match_rain_screened), nrow(match_closest)),
+  n_sites = c(n_distinct(match_5d$siteSR_id), n_distinct(match_rain_screened$siteSR_id),
+              n_distinct(match_closest$siteSR_id))
+)
+```
+
+```{r data-reduction-table}
+step_labels <- c(
+  "0_raw_nationwide" = "Raw nationwide",
+  "1_quality_tier_flag_filters" = "Tier/flag QC filters",
+  "2_regional_HUC4_restriction" = "Regional HUC4 restriction",
+  "3_ransac_inliers_for_matching" = "RANSAC inliers",
+  "1_geometry_and_HUC4_scoped" = "Geometry and regional HUC4 restriction",
+  "2_metadata_scene_QA" = "Metadata/scene QA",
+  "3_band_ransac_filter_final" = "RANSAC inliers",
+  "0_5day_window_match" = "±5-day window match",
+  "1_heavy_rain_screen" = "Heavy rain screen",
+  "2_closest_observation_final" = "Closest observation (final)"
+)
+
+data_reduction <- bind_rows(row_log_01, row_log_matched) %>%
+  mutate(Pipeline = factor(pipeline, levels = c("SDD", "siteSR", "matched"),
+                           labels = c("SDD", "siteSR", "Matched")),
+         Step = step_labels[step]) %>%
+  arrange(Pipeline, step) %>%
+  select(Pipeline, Step, Rows = n_rows, Sites = n_sites)
+
+stopifnot(!anyNA(data_reduction$Step))
+
+write_csv(data_reduction, file.path(manuscript_dir, "supp_table_1_data_reduction.csv"), na = "")
+
+knitr::kable(data_reduction,
+             caption = "Data reduction at each step of the filtering process leading up to developing the model to estimate Secchi disc depth across our six-state region.",
+             format.args = list(big.mark = ","))
+```
+
+
+### Supplemental Table 2: candidate features
+
+Candidate features and their fate through feature selection in
+`04_make_models.ipynb`. The candidate list, correlation-pruned list, and each
+seed's final feature set are read from each seed's
+`backward_elim_summary.json`. Correlation pruning is deterministic across seeds
+(all seeds share the same CV pool), so a single pruned set is reported.
+Descriptions are written by hand here and checked against the candidate list
+so a feature added or removed upstream fails loudly rather than silently.
+
+```{r supp-table-2-load}
+seed_elim <- map(ensemble_seeds, \(s) {
+  read_json(file.path(models_dir, paste0("seed", s), "backward_elim_summary.json"),
+            simplifyVector = TRUE)
+}) %>%
+  set_names(ensemble_seeds)
+
+candidates <- seed_elim[[1]]$starting_candidates
+pruned <- seed_elim[[1]]$correlation_pruned
+
+stopifnot("candidate lists differ across seeds" =
+            all(map_lgl(seed_elim, \(x) setequal(x$starting_candidates, candidates))),
+          "correlation-pruned lists differ across seeds" =
+            all(map_lgl(seed_elim, \(x) setequal(x$correlation_pruned, pruned))))
+
+n_seeds_selected <- map(seed_elim, "final_features") %>%
+  unlist() %>%
+  table() %>%
+  c()
+```
+
+```{r supp-table-2-descriptions}
+weather_desc <- function(var, w) {
+  day_txt <- if (w == 1) "the day" else paste(w, "days")
+  switch(var,
+         precip_mm = paste0("Total precipitation over ", day_txt, " before the matchup (mm)"),
+         tmax_degC = paste0("Maximum daily maximum air temperature over ", day_txt, " before the matchup (°C)"),
+         tmin_degC = paste0("Minimum daily minimum air temperature over ", day_txt, " before the matchup (°C)"),
+         tmean_degC = paste0("Mean daily air temperature over ", day_txt, " before the matchup (°C)"),
+         srad_Wm2 = paste0("Mean daily shortwave radiation over ", day_txt, " before the matchup (W m⁻²)"))
+}
+
+weather_feats <- expand_grid(var = c("precip_mm", "tmax_degC", "tmean_degC", "tmin_degC", "srad_Wm2"),
+                             w = c(1, 3, 7, 30)) %>%
+  mutate(Feature = paste0(var, "_prev", w),
+         Description = map2_chr(var, w, weather_desc),
+         Category = "Antecedent weather",
+         Source = "gridMET")
+
+band_src <- "Landsat C2 SR, harmonized to Landsat 7 (Gardner et al.)"
+feature_desc <- tribble(
+  ~Feature, ~Category, ~Description, ~Source,
+  "blue_corr7", "Optical", "Blue surface reflectance", band_src,
+  "green_corr7", "Optical", "Green surface reflectance", band_src,
+  "red_corr7", "Optical", "Red surface reflectance", band_src,
+  "nir_corr7", "Optical", "Near-infrared surface reflectance", band_src,
+  "swir1_corr7", "Optical", "Shortwave infrared 1 surface reflectance", band_src,
+  "swir2_corr7", "Optical", "Shortwave infrared 2 surface reflectance", band_src,
+  "temp_corr7", "Optical", "Surface temperature", band_src,
+  "atm_corr_LaSRC", "Optical", "Atmospheric correction algorithm (1 = LaSRC, Landsat 8/9; 0 = LEDAPS, Landsat 4/5/7)", "Landsat mission",
+  "BR", "Optical", "Blue:red ratio", "Derived",
+  "BG", "Optical", "Blue:green ratio", "Derived",
+  "NR", "Optical", "Near-infrared:red ratio", "Derived",
+  "GR", "Optical", "Green:red ratio", "Derived",
+  "fai", "Optical", "Floating algae index", "Derived",
+  "NDVI", "Optical", "Normalized difference vegetation index, (NIR − red)/(NIR + red)", "Derived",
+  "NDSSI", "Optical", "Normalized difference suspended sediment index, (blue − NIR)/(blue + NIR)", "Derived",
+  "NDWI", "Optical", "Normalized difference water index, (green − NIR)/(green + NIR) (McFeeters 1996)", "Derived",
+  "MNDWI", "Optical", "Modified NDWI, (green − SWIR1)/(green + SWIR1) (Xu 2006)", "Derived",
+  "elevation_m", "Site/catchment", "Site elevation (m)", "AWS terrain tiles",
+  "catchment_area_sqkm", "Site/catchment", "Local catchment area (km², winsorized at 617 km² and log-binned)", "LakeCat",
+  "pct_impervious_2006", "Site/catchment", "Catchment impervious surface (%, 2006)", "LakeCat",
+  "pct_urban_2006", "Site/catchment", "Catchment developed land cover (%, 2006)", "LakeCat",
+  "pct_forest_2006", "Site/catchment", "Catchment forest land cover (%, 2006)", "LakeCat",
+  "pct_cropland_2006", "Site/catchment", "Catchment cropland land cover (%, 2006)", "LakeCat",
+  "pct_wetland_2006", "Site/catchment", "Catchment wetland land cover (%, 2006)", "LakeCat",
+  "shore_flag", "Site/catchment", "Site within 230 m of shoreline or outside its matched waterbody polygon (1 = yes)", "siteSR QA flags"
+) %>%
+  bind_rows(select(weather_feats, Feature, Category, Description, Source))
+
+stopifnot("candidate features missing a description" = all(candidates %in% feature_desc$Feature))
+```
+
+```{r supp-table-2}
+supp_table_2 <- feature_desc %>%
+  filter(Feature %in% candidates) %>%
+  mutate(Category = factor(Category, levels = c("Optical", "Site/catchment", "Antecedent weather")),
+         `Retained after correlation pruning` = if_else(Feature %in% pruned, "Yes", "No"),
+         `Seeds selecting (of 10)` = as.integer(coalesce(n_seeds_selected[Feature], 0L))) %>%
+  arrange(Category, match(Feature, candidates)) %>%
+  select(Category, Feature, Description, Source,
+         `Retained after correlation pruning`, `Seeds selecting (of 10)`)
+
+write_csv(supp_table_2, file.path(manuscript_dir, "supp_table_2_candidate_features.csv"))
+
+knitr::kable(supp_table_2,
+             caption = paste0("Candidate features considered for the Secchi disc depth model (n = ",
+                              length(candidates), "). Features were first reduced by correlation pruning (|r| > 0.95; ",
+                              length(pruned), " retained), then each of the 10 ensemble seeds performed its own ",
+                              "backward elimination. Features selected by all 10 seeds (n = ",
+                              sum(supp_table_2$`Seeds selecting (of 10)` == 10),
+                              ") form the common core used for SHAP attribution."))
+```
+
+### Supplemental Table 3: hyperparameter search space
+
+The search grid is `PARAM_SPACE` in `python/model_xgb.py`, reproduced here and
+checked against every seed's selected values from
+`final_tune_xgboost.json`. Both tuning stages (25 trials on the
+correlation-pruned set, 40 on each seed's final set) sample from this grid;
+the selected-value column reports the final stage.
+
+```{r supp-table-3}
+param_grid <- tribble(
+  ~Hyperparameter, ~Description, ~values,
+  "eta", "Learning rate", c(0.01, 0.03, 0.05),
+  "max_depth", "Maximum tree depth", c(2, 3, 4),
+  "min_child_weight", "Minimum sum of instance weight in a child node", c(3, 5, 7, 10),
+  "subsample", "Fraction of rows sampled per tree", c(0.6, 0.7, 0.8),
+  "colsample_bytree", "Fraction of features sampled per tree", c(0.4, 0.5, 0.7),
+  "reg_alpha", "L1 regularization on leaf weights", c(0, 0.1, 1, 5),
+  "reg_lambda", "L2 regularization on leaf weights", c(1, 5, 10, 20)
+)
+
+seed_params <- map(ensemble_seeds, \(s) {
+  read_json(file.path(models_dir, paste0("seed", s), "final_tune_xgboost.json"))$best_params %>%
+    as_tibble() %>%
+    mutate(seed = s)
+}) %>%
+  list_rbind() %>%
+  pivot_longer(-seed, names_to = "Hyperparameter", values_to = "value")
+
+stopifnot("selected hyperparameter outside the documented grid" =
+            seed_params %>%
+              left_join(param_grid, by = "Hyperparameter") %>%
+              pmap_lgl(\(value, values, ...) value %in% values) %>%
+              all(),
+          "grid is missing a tuned hyperparameter" =
+            setequal(unique(seed_params$Hyperparameter), param_grid$Hyperparameter))
+
+selected_summary <- seed_params %>%
+  count(Hyperparameter, value) %>%
+  arrange(Hyperparameter, value) %>%
+  summarise(`Selected values (n seeds)` = paste0(value, " (", n, ")", collapse = ", "),
+            .by = Hyperparameter)
+
+supp_table_3 <- param_grid %>%
+  mutate(`Values searched` = map_chr(values, \(v) paste(v, collapse = ", "))) %>%
+  left_join(selected_summary, by = "Hyperparameter") %>%
+  select(Hyperparameter, Description, `Values searched`, `Selected values (n seeds)`)
+
+write_csv(supp_table_3, file.path(manuscript_dir, "supp_table_3_hyperparameters.csv"))
+
+knitr::kable(supp_table_3,
+             caption = paste("XGBoost hyperparameter search space. Each tuning stage drew random combinations",
+                             "from this grid (25 trials before backward elimination, 40 after), scored by",
+                             "mean four-fold cross-validation RMSE. Among trials within 2% of the best",
+                             "validation RMSE, the one with the smallest train–validation RMSE gap was selected.",
+                             "Models used a squared-error objective and were trained for up to 5,000 boosting",
+                             "rounds with early stopping after 250 rounds without improvement in validation RMSE.",
+                             "Selected values are from the final tuning stage",
+                             "across the 10 ensemble seeds."))
+```
+

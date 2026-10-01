@@ -1,0 +1,184 @@
+---
+title: "Pull Site Characteristics"
+author: "B Steele, Colorado State University, ROSSyndicate"
+date: "last updated Sep 16, 2026"
+output: html_document
+# Quarto site build: show code only, don't re-run the fetches
+execute:
+  eval: false
+---
+
+**Pipeline step 02b · R · run from `regional_clarity/` · output is cached; re-run only when the site set changes; not executed when the site is built**
+
+- **Purpose:** Fetch static per-site features: point elevation and LakeCat catchment land-cover metrics.
+- **Inputs:** `aquamatch_files/filtered_regional_sdd.parquet`; site metadata CSV; elevation and LakeCat APIs.
+- **Outputs:** `aquamatch_files/site_characteristics.feather`.
+- **Previous:** [02a · Make matchups](02a_make_matches.Rmd) · **Next:** [02c · Pull weather summaries](02c_pull_weather_summaries.Rmd)
+
+This script pulls static site/catchment characteristics — point elevation and
+LakeCat catchment land-cover metrics — for a set of AquaMatch sites, and
+writes a small per-site lookup table for use as model features (joined in
+`03_split_data.ipynb`).
+
+The lookup table only depends on which sites are in the matchup set, so
+it is cached. Run this step when building the pipeline from scratch, and
+again whenever changes in `01`/`02a` alter the site set. Otherwise the
+cached table can be reused.
+
+Variable choice follows Topp et al. 2021 (*Environ. Res. Lett.* 16 055025),
+which paired optical variables with LakeCat catchment metrics
+(imperviousness, urban/forest/cropland/wetland land cover, all from the 2006
+land-cover snapshot) for a national Secchi-depth model.
+
+## Requirements for the input site table
+
+Any AquaMatch-derived (or AquaMatch-shaped) table with one row per
+observation and, at minimum, the columns below will work as
+`sites_input_path` — this script `distinct()`s down to one row per site
+before fetching anything:
+
+- `siteSR_id` — site identifier
+- `lat`, `lon` — WGS84 coordinates
+
+`site_metadata_path` is AquaMatch's own raw site list (the
+`siteSR_collated_WQP_NWIS_sites_with_NHD_info_*.csv` produced upstream of
+this project, e.g. by `AquaMatch_siteSR_WQP`'s `add_NHD_waterbody_to_sites.R`
+step) — it carries the NHDPlusV2 waterbody linkage (`wb_nhd_id`) each site
+was already matched to, which is what LakeCat is keyed on.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+Load the packages for spatial handling (`sf`), elevation lookups (`elevatr`),
+and LakeCat queries (`StreamCatTools`), define a small timestamped logging
+helper, and set the input and output paths.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(arrow)
+library(dplyr)
+library(readr)
+library(sf)
+library(elevatr)
+library(StreamCatTools)
+
+log <- function(...) cat(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")), sprintf(...), "\n")
+
+# -- inputs (AquaMatch-shaped; see "Requirements" above) --
+# this branch's canonical filtered/matched site set (03_split_data.ipynb's
+# own input, from 02a_make_matches.Rmd)
+sites_input_path <- "aquamatch_files/filtered_regional_sdd.parquet"
+# AquaMatch's raw site metadata, carrying the NHDPlusV2 waterbody linkage
+site_metadata_path <- "aquamatch_files/downloads/siteSR_collated_WQP_NWIS_sites_with_NHD_info_2025-06-04.csv"
+
+# -- output --
+output_path <- "aquamatch_files/site_characteristics.feather"
+```
+
+## Unique sites in the input set
+
+Reduce the observation-level input to one row per site, then join AquaMatch's
+site metadata to attach each site's NHD waterbody identifier (`wb_nhd_id`),
+source, name, and area. The log reports how many sites have a usable
+waterbody identifier for the LakeCat join.
+
+```{r unique-sites}
+final <- read_parquet(sites_input_path, col_select = c("siteSR_id", "lat", "lon"))
+sites_unique <- distinct(final, siteSR_id, lat, lon)
+log("n unique sites: %s", nrow(sites_unique))
+
+sites_meta <- read_csv(site_metadata_path, show_col_types = FALSE) %>%
+  select(siteSR_id, wb_nhd_id, wb_nhd_source, wb_gnis_name, wb_areasqkm)
+sites_unique <- sites_unique %>% left_join(sites_meta, by = "siteSR_id")
+log("sites with a valid wb_nhd_id (comid): %s / %s",
+    sum(!is.na(sites_unique$wb_nhd_id)), nrow(sites_unique))
+```
+
+`wb_nhd_id` is treated below as an NHDPlusV2 comid — safe to join straight
+into LakeCat with no crosswalk, *provided* every site's `wb_nhd_source` is
+`"NHDPlusv2"` (the alternative, `Permanent_Identifier`, only fires for
+non-CONUS HUC4s >= 1900). This was true for all 1,525 sites in the original
+research pull; re-checked here every run rather than assumed, since the
+active site set can change as `01`/`02a` are reworked.
+
+```{r verify-nhd-source}
+stopifnot("some sites resolve to a non-NHDPlusv2 waterbody source - LakeCat join below is not safe as-is" =
+            all(sites_unique$wb_nhd_source == "NHDPlusv2" | is.na(sites_unique$wb_nhd_source)))
+```
+
+## 1. Elevation (point, AWS terrain tiles)
+
+Look up the elevation at each site's coordinates from the AWS terrain tiles
+at zoom level 9, which gives roughly 300 m ground resolution at mid-latitudes. Lake
+surface elevation serves as a proxy for climate and landscape position (e.g., high-elevation
+oligotrophic lakes versus low-elevation reservoirs).
+
+```{r fetch-elevation}
+log("fetching elevation for all sites")
+pts_sf <- st_as_sf(sites_unique, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+t0 <- Sys.time()
+elev <- get_elev_point(pts_sf, src = "aws", z = 9)
+log("elevation fetch took %.1f min", as.numeric(difftime(Sys.time(), t0, units = "mins")))
+
+elev_df <- st_drop_geometry(elev) %>% select(siteSR_id, elevation_m = elevation)
+sites_unique <- sites_unique %>% left_join(elev_df, by = "siteSR_id")
+log("elevation summary:"); print(summary(sites_unique$elevation_m))
+```
+
+## 2. LakeCat catchment characteristics
+
+Land-cover-focused set, matching Topp et al.'s variable categories:
+imperviousness, urban/forest/cropland/wetland land cover (2006, static, same
+year Topp used), plus catchment area (LakeCat provides this for free
+alongside any metric query).
+
+Comids are requested in batches of 200 to keep each request URL a
+manageable length. The individual land-cover classes are then summed into
+combined forest, wetland, and urban percentages, and the results are joined
+back to the sites by comid.
+
+```{r fetch-lakecat}
+log("fetching LakeCat catchment metrics")
+lakecat_metrics <- paste(c(
+  "pctimp2006", "pcturbhi2006", "pcturblo2006", "pcturbmd2006", "pcturbop2006",
+  "pctconif2006", "pctdecid2006", "pctmxfst2006",
+  "pcthbwet2006", "pctwdwet2006", "pctcrop2006"
+), collapse = ",")
+
+comids <- unique(na.omit(sites_unique$wb_nhd_id))
+log("n unique comids: %s", length(comids))
+
+# batch in chunks to keep the request URL a reasonable length
+chunk_size <- 200
+chunks <- split(comids, ceiling(seq_along(comids) / chunk_size))
+lakecat_raw <- purrr::map_dfr(chunks, function(ch) {
+  lc_get_data(comid = paste(ch, collapse = ","), metric = lakecat_metrics,
+              aoi = "catchment", showAreaSqKm = TRUE)
+})
+log("LakeCat rows returned: %s / %s comids requested", nrow(lakecat_raw), length(comids))
+
+lakecat <- lakecat_raw %>%
+  mutate(comid = as.character(comid),
+         pct_forest_2006 = pctconif2006cat + pctdecid2006cat + pctmxfst2006cat,
+         pct_wetland_2006 = pcthbwet2006cat + pctwdwet2006cat,
+         pct_urban_2006 = pcturbhi2006cat + pcturblo2006cat + pcturbmd2006cat + pcturbop2006cat) %>%
+  select(comid, catchment_area_sqkm = catareasqkm,
+         pct_impervious_2006 = pctimp2006cat, pct_urban_2006, pct_forest_2006,
+         pct_cropland_2006 = pctcrop2006cat, pct_wetland_2006)
+
+sites_unique <- sites_unique %>% left_join(lakecat, by = c("wb_nhd_id" = "comid"))
+log("sites with LakeCat data: %s / %s", sum(!is.na(sites_unique$pct_impervious_2006)), nrow(sites_unique))
+```
+
+## Export
+
+Write the per-site lookup table. `wb_nhd_source` is dropped because it was
+only needed for the check above. [03 · Split data](03_split_data.ipynb)
+joins this table to the matchups by `siteSR_id`.
+
+```{r export}
+write_feather(sites_unique %>% select(-wb_nhd_source), output_path)
+log("wrote %s (%s cols, %s rows)", output_path, ncol(sites_unique) - 1, nrow(sites_unique))
+```
