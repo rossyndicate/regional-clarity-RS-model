@@ -29,18 +29,18 @@
     "tmax_degC_prev30"
   ],
   "best_params": {
-    "eta": 0.01,
+    "eta": 0.05,
     "max_depth": 3,
-    "min_child_weight": 7,
+    "min_child_weight": 5,
     "subsample": 0.6,
-    "colsample_bytree": 0.7,
-    "reg_alpha": 0,
-    "reg_lambda": 20
+    "colsample_bytree": 0.5,
+    "reg_alpha": 1,
+    "reg_lambda": 1
   },
-  "best_score": 1.4345607419328663,
-  "best_gap": 0.43768451597179103,
-  "best_train_rmse": 0.9968762259610753,
-  "pure_best_val_rmse": 1.4234390977088047,
+  "best_score": 1.4404916951107145,
+  "best_gap": 0.4171751499935885,
+  "best_train_rmse": 1.023316545117126,
+  "pure_best_val_rmse": 1.4168843202500454,
   "band_size": 23,
   "n_trials": 40
 }

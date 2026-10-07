@@ -49,7 +49,7 @@ rs_estimates <- read_parquet(file.path(application_dir, "application_rs_estimate
 insitu_days <- read_parquet(file.path(application_dir, "application_insitu_location_days.parquet"))
 superseded_validation <- read_csv(file.path(application_dir, "superseded_validation.csv"), show_col_types = FALSE) %>%
   filter(sites == "all sites")
-aoa_params <- read_json(file.path(application_dir, "aoa_parameters.json"))
+aoa_params <- read_json(file.path("regional_clarity", "xg_models", "v3_production", "applicability", "aoa_parameters.json"))
 
 # remote sensing estimates on days with no in situ observation at that location
 rs_new <- anti_join(rs_estimates, insitu_days, by = c("location_id", "date"))
