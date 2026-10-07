@@ -47,7 +47,7 @@ The model card for the production ensemble is [`regional_clarity/xg_models/v3_pr
 
 ## Workflow
 
-Data preparation and application run in R (`.Rmd`). Modeling runs in Python notebooks (`.ipynb`) that share the modules in `regional_clarity/python/`. Arrows are labeled with the main file each step hands to the next. Data files live under `regional_clarity/aquamatch_files/` and models under `regional_clarity/xg_models/`; neither is tracked in git.
+Data preparation and application run in R (`.Rmd`). Modeling runs in Python notebooks (`.ipynb`) that share the modules in `regional_clarity/python/`. Step 07 sources the R functions in `regional_clarity/R/`. Arrows are labeled with the main file each step hands to the next. Data files live under `regional_clarity/aquamatch_files/` and are not tracked in git. Models live under `regional_clarity/xg_models/`, and the production model folder, `v3_production/`, is tracked.
 
 <!-- keep in sync with pipeline_diagram.mmd, which the Quarto site renders -->
 ```mermaid
@@ -113,6 +113,17 @@ flowchart TD
 Manuscript tables and figures are built by [`manuscript_tables_figures.Rmd`](regional_clarity/asv2_manuscript/manuscript_tables_figures.Rmd), kept for reproducibility and not part of the rendered site.
 
 Each file opens with a header listing its purpose, inputs, outputs, the working directory to run it from, and links to the previous and next steps.
+
+## Applying the model to your own data
+
+The production model folder ([`regional_clarity/xg_models/v3_production/`](regional_clarity/xg_models/v3_production/), also on the Hugging Face Hub) holds only the fitted ensemble and the files the applicability checks need. The code for applying the model lives in this repository:
+
+| File | Language | What it does |
+|---|---|---|
+| [`regional_clarity/R/prepare_model_inputs.R`](regional_clarity/R/prepare_model_inputs.R) | R | Build model inputs from AquaMatch siteSR sites and QA'd observations: elevation, LakeCat catchment metrics, gridMET antecedent weather, spectral indices, and site-feature coarsening. Step 07 uses the same functions. |
+| [`regional_clarity/python/apply_model.py`](regional_clarity/python/apply_model.py) | Python | Load the 40-booster ensemble, predict SDD, and run the applicability checks against the model folder's `applicability/` files. |
+
+The [model card](regional_clarity/xg_models/v3_production/README.md#how-to-use) has a worked example.
 
 ## Python environment
 

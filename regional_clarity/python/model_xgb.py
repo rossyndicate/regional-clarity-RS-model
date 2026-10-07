@@ -32,7 +32,12 @@ def _fit_fold(train_X, train_y, val_X, val_y, params, nrounds=3000, early_stop=1
     booster = xgb.train(full_params, dtrain, num_boost_round=nrounds,
                          evals=[(dtrain, "train"), (dval, "val")],
                          early_stopping_rounds=early_stop, verbose_eval=False)
-    return booster, booster.best_score
+    # keep only the rounds up to the best validation score. Booster.predict
+    # in Python uses every round by default while R's predict stops at
+    # best_iteration, so truncating here means the saved model is the one
+    # every consumer (tuning, evaluation, SHAP, R, end users) actually uses
+    best_score = booster.best_score
+    return booster[: booster.best_iteration + 1], best_score
 
 
 def train_fold_models(folds: list, feats: list, target: str, params: dict, weight_fn=None) -> list:

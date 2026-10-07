@@ -26,6 +26,11 @@ regional_clarity/xg_models/hypertune/
 # ...except Quarto's frozen Rmd results, which the site build needs
 !_freeze/**/*.png
 
+# ...and the model folder's tables that users need to apply the model
+# (SHAP ranking, per-seed feature table, applicability-check reference)
+!regional_clarity/xg_models/v3_production/*.csv
+!regional_clarity/xg_models/v3_production/applicability/*.csv
+
 # rendered Quarto site (built and deployed by .github/workflows/publish.yml)
 /_site/
 

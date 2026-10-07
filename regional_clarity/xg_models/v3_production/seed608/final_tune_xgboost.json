@@ -7,7 +7,6 @@
     "swir1_corr7",
     "temp_corr7",
     "precip_mm_prev1",
-    "tmean_degC_prev7",
     "srad_Wm2_prev1",
     "srad_Wm2_prev7",
     "tmean_degC_prev30",
@@ -32,18 +31,18 @@
     "tmax_degC_prev30"
   ],
   "best_params": {
-    "eta": 0.01,
+    "eta": 0.05,
     "max_depth": 3,
     "min_child_weight": 5,
-    "subsample": 0.7,
+    "subsample": 0.6,
     "colsample_bytree": 0.4,
-    "reg_alpha": 0,
-    "reg_lambda": 10
+    "reg_alpha": 1,
+    "reg_lambda": 1
   },
-  "best_score": 1.4504656814817183,
-  "best_gap": 0.4033202238389526,
-  "best_train_rmse": 1.0471454576427657,
-  "pure_best_val_rmse": 1.4251872560074432,
-  "band_size": 23,
+  "best_score": 1.4390769713285285,
+  "best_gap": 0.373870805439259,
+  "best_train_rmse": 1.0652061658892695,
+  "pure_best_val_rmse": 1.4218083145381057,
+  "band_size": 27,
   "n_trials": 40
 }

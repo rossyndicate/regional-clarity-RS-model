@@ -44,10 +44,10 @@
     "reg_alpha": 5,
     "reg_lambda": 5
   },
-  "best_score": 1.479186904676188,
-  "best_gap": 0.5142760472432336,
-  "best_train_rmse": 0.9649108574329545,
-  "pure_best_val_rmse": 1.457732621251958,
-  "band_size": 9,
+  "best_score": 1.4762836221573026,
+  "best_gap": 0.4535515194672213,
+  "best_train_rmse": 1.0227321026900813,
+  "pure_best_val_rmse": 1.4550441674333126,
+  "band_size": 11,
   "n_trials": 40
 }

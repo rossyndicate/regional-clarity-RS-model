@@ -28,13 +28,13 @@ model-index:
           split: holdout
         metrics:
           - type: rmse
-            value: 1.259
+            value: 1.257
             name: Holdout RMSE (m)
           - type: mae
-            value: 0.940
+            value: 0.941
             name: Holdout MAE (m)
           - type: r_squared
-            value: 0.626
+            value: 0.627
             name: Holdout R²
 ---
 
@@ -85,7 +85,7 @@ The [Applicability checks](#applicability-checks) section gives the exact criter
 
 ## How to use
 
-The model is published on the Hugging Face Hub as [`bgsteele/intermountain-west-regional-clarity-sdd-landsat`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat). It contains the full ensemble:
+The model is published on the Hugging Face Hub as [`bgsteele/intermountain-west-regional-clarity-sdd-landsat`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat). The Hub repository holds the fitted ensemble and the files the applicability checks need:
 
 ```
 seed601/ … seed610/
@@ -94,45 +94,44 @@ seed601/ … seed610/
   final_eval_summary.json      # that seed's CV and holdout metrics
   xgboost_fold{1-4}.json       # the four fitted boosters (XGBoost JSON format)
 ensemble_mean_abs_shap.csv     # ensemble SHAP ranking (also used to weight the AOA check)
+supplemental_feature_table.csv # every candidate feature, its pruning outcome, and which seeds kept it
+applicability/
+  aoa_parameters.json          # AOA threshold and scaling, training ranges, seasonal window, missions
+  aoa_reference.csv            # training observations in AOA space, for the nearest-neighbor DI
 ```
 
-The seed folders are also tracked in the source repository under [`regional_clarity/xg_models/v3_production/`](https://github.com/rossyndicate/regional-clarity-RS-model/tree/main/regional_clarity/xg_models/v3_production). `ensemble_mean_abs_shap.csv` is not, but [step 05](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/05_evaluate_ensemble.html) regenerates it.
+The same folder is tracked in the source repository under [`regional_clarity/xg_models/v3_production/`](https://github.com/rossyndicate/regional-clarity-RS-model/tree/main/regional_clarity/xg_models/v3_production). [Step 05](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/05_evaluate_ensemble.html) writes the SHAP ranking and [step 07](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07_regional_application.html) writes `applicability/`.
 
-Each seed has its own feature set, so every booster has to be given its seed's features, in order. The code below loads all 40 members and returns the ensemble mean. `X` is a pandas DataFrame with one row per observation and columns named as in [Features](#features). Spectral indices and coarsened site features must be computed first, using `add_spectral_indices()` and `coarsen_site_features()` from [`regional_clarity/python/features.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/features.py) in the source repository.
+The code for applying the model lives in the [source repository](https://github.com/rossyndicate/regional-clarity-RS-model), not on the Hub. Applying it takes two steps:
+
+1. **Prepare inputs (R).** [`regional_clarity/R/prepare_model_inputs.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/prepare_model_inputs.R) builds one row per observation from AquaMatch siteSR sites and observations that passed siteSR QA. It fetches elevation, LakeCat catchment metrics, and gridMET antecedent weather, then computes the spectral indices and coarsened site features. Step 07 runs this same code for the regional application.
+2. **Predict and screen (Python).** [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) loads the 40 boosters, gives each one its seed's features in order, and returns the ensemble mean. It then runs the [applicability checks](#applicability-checks) against `applicability/`, so you can screen observations without the training data.
+
+```r
+source("regional_clarity/R/prepare_model_inputs.R")
+model_input <- prepare_model_inputs(sites, sitesr_rows)   # see the file header for the expected columns
+arrow::write_parquet(model_input, "model_input.parquet")
+```
 
 ```python
-import json
-from pathlib import Path
+import sys
 
-import numpy as np
-import xgboost as xgb
+import pandas as pd
 from huggingface_hub import snapshot_download
 
-from features import add_spectral_indices, coarsen_site_features  # from the source repository
+sys.path.insert(0, "regional_clarity/python")   # from the source repository
+from apply_model import load_ensemble, predict_sdd, check_applicability
 
-
-def load_ensemble(model_dir):
-    members = []
-    for seed_dir in sorted(Path(model_dir).glob("seed*")):
-        feats = json.loads((seed_dir / "backward_elim_summary.json").read_text())["final_features"]
-        for fold in range(1, 5):
-            booster = xgb.Booster()
-            booster.load_model(str(seed_dir / f"xgboost_fold{fold}.json"))
-            members.append((feats, booster))
-    return members
-
-
-def predict_sdd(members, X):
-    return np.mean([b.predict(xgb.DMatrix(X[feats])) for feats, b in members], axis=0)
-
-
-model_dir = snapshot_download("bgsteele/intermountain-west-regional-clarity-sdd-landsat")   # or a local copy of the folder
-members = load_ensemble(model_dir)   # 40 members
-X = coarsen_site_features(add_spectral_indices(X))
-sdd_m = predict_sdd(members, X)
+model_dir = snapshot_download("bgsteele/intermountain-west-regional-clarity-sdd-landsat")   # or regional_clarity/xg_models/v3_production
+X = pd.read_parquet("model_input.parquet")
+X["pred_sdd"] = predict_sdd(load_ensemble(model_dir), X)   # 40 members
+flags = check_applicability(X, model_dir, pred_sdd=X["pred_sdd"])   # one pass_* column per check, plus di
+usable = X[flags["pass_all"]]
 ```
 
-This code reproduces the published holdout RMSE (1.2589 m) when it is run on the training repository's holdout table.
+To stay in R, follow the prediction and applicability sections of step 07, which give the same results.
+
+`predict_sdd()` reproduces the published holdout RMSE (1.2567 m) on the training repository's holdout table.
 
 On macOS, set `OMP_NUM_THREADS` and `KMP_DUPLICATE_LIB_OK=TRUE` before importing XGBoost alongside other OpenMP libraries. The [repository README](https://github.com/rossyndicate/regional-clarity-RS-model#python-environment) explains why. Exact package versions are listed in `requirements-lock.txt` in the source repository.
 
@@ -175,12 +174,12 @@ Each of the 10 seeds runs the full pipeline independently ([step 04](https://ros
 5. **Final gap-aware tuning.** A 40-trial search is run on the selected feature set.
 6. **Final training.** Four fold models are trained, each with early stopping (5,000 rounds maximum, patience 250) against its own validation fold.
 
-The models are trained unweighted. Every seed converged on shallow, heavily regularized trees:
+Each final fold model keeps only the boosting rounds up to its best validation score; the rounds trained during the patience window are discarded, so every booster is saved and applied at its early-stopping point. The models are trained unweighted. Every seed converged on shallow trees:
 
 | Hyperparameter | Search space | Selected across seeds |
 |---|---|---|
-| `max_depth` | 2, 3, 4 | 3 (all seeds) |
-| `eta` | 0.01, 0.03, 0.05 | 0.01 (9 seeds), 0.03 (1) |
+| `max_depth` | 2, 3, 4 | 3 (9 seeds), 4 (1) |
+| `eta` | 0.01, 0.03, 0.05 | 0.01 (4 seeds), 0.03 (3), 0.05 (3) |
 | `subsample` | 0.6, 0.7, 0.8 | 0.6–0.8 |
 | `colsample_bytree` | 0.4, 0.5, 0.7 | 0.4–0.7 |
 | `min_child_weight` | 3, 5, 7, 10 | 3–10 |
@@ -191,32 +190,30 @@ The exact values for each seed are in `seed*/final_tune_xgboost.json`.
 
 ## Features
 
-Each seed keeps between 26 and 33 features. Twenty-one features were kept by every seed (the *unanimous core*). The table shows how many of the 10 seeds kept each feature. Features dropped by correlation pruning (red, blue, and SWIR2 bands; GR ratio; most 1- and 3-day weather windows) are not shown.
+Each seed keeps between 26 and 33 features. Twenty-two features were kept by every seed (the *unanimous core*). The table shows how many of the 10 seeds kept each feature. Features dropped by correlation pruning (red, blue, and SWIR2 bands; GR ratio; most 1- and 3-day weather windows) are not shown.
 
 | Group | Feature | Seeds | Definition |
 |---|---|---|---|
 | Optical | `green_corr7`, `nir_corr7`, `temp_corr7` | 10 | Median surface reflectance (green, NIR) and surface temperature, harmonized to Landsat 7 |
 | | `swir1_corr7` | 9 | SWIR1 surface reflectance, harmonized to Landsat 7 |
 | | `BR`, `BG`, `NR` | 10 | Blue/red, blue/green, and NIR/red band ratios |
-| | `fai`, `NDVI`, `NDSSI`, `MNDWI` | 10 | Floating Algae Index, NDVI, NDSSI ((blue − NIR)/(blue + NIR)), and MNDWI (Xu 2006) |
-| | `NDWI` | 9 | NDWI (McFeeters 1996) |
+| | `fai`, `NDVI`, `NDSSI`, `NDWI`, `MNDWI` | 10 | Floating Algae Index, NDVI, NDSSI ((blue − NIR)/(blue + NIR)), NDWI (McFeeters 1996), and MNDWI (Xu 2006) |
 | | `atm_corr_LaSRC` | 10 | 1 for Landsat 8/9 (LaSRC atmospheric correction), 0 for Landsat 4/5/7 (LEDAPS) |
 | Site | `catchment_area_sqkm` | 10 | LakeCat catchment area, winsorized at 617.1 km² and binned to 0.1 log10 units |
-| | `pct_impervious_2006`, `pct_forest_2006`, `pct_cropland_2006`, `pct_wetland_2006` | 10 | LakeCat catchment land cover (NLCD 2006), rounded to whole percent |
-| | `pct_urban_2006` | 8 | LakeCat catchment urban land cover, rounded to whole percent |
-| | `elevation_m` | 9 | Site elevation |
+| | `pct_impervious_2006`, `pct_forest_2006`, `pct_wetland_2006` | 10 | LakeCat catchment land cover (NLCD 2006), rounded to whole percent |
+| | `pct_urban_2006`, `pct_cropland_2006` | 9 | LakeCat catchment land cover (NLCD 2006), rounded to whole percent |
+| | `elevation_m` | 2 | Site elevation |
 | | `shore_flag` | 10 | 1 if the site is within 230 m of the matched waterbody's shoreline or falls outside its polygon |
-| Weather | `srad_Wm2_prev1`, `tmean_degC_prev30`, `tmin_degC_prev30`, `tmax_degC_prev30`, `srad_Wm2_prev30` | 10 | gridMET summaries over the *N* days strictly before the image date: mean for `srad` and `tmean`, minimum for `tmin`, maximum for `tmax`, and total for `precip` |
-| | `tmean_degC_prev7`, `srad_Wm2_prev7` | 7 | |
-| | `tmin_degC_prev7` | 6 | |
-| | `precip_mm_prev30` | 5 | |
-| | `precip_mm_prev1` | 4 | |
-| | `tmax_degC_prev7` | 3 | |
-| | `precip_mm_prev3` | 1 | |
+| Weather | `srad_Wm2_prev1`, `srad_Wm2_prev7`, `srad_Wm2_prev30`, `tmean_degC_prev30`, `tmax_degC_prev30` | 10 | gridMET summaries over the *N* days strictly before the image date: mean for `srad` and `tmean`, minimum for `tmin`, maximum for `tmax`, and total for `precip` |
+| | `tmin_degC_prev30` | 9 | |
+| | `precip_mm_prev1` | 7 | |
+| | `tmean_degC_prev7`, `tmin_degC_prev7` | 5 | |
+| | `precip_mm_prev3`, `precip_mm_prev7`, `tmax_degC_prev7` | 4 | |
+| | `precip_mm_prev30` | 3 | |
 
 The catchment and land-cover features are coarsened because they are constant for every observation on a waterbody. Without coarsening, a model could use them to identify a waterbody instead of describing it. The 617.1 km² cap is fixed at the training-data 99th percentile and must be applied unchanged at inference. XGBoost handles missing values natively, and band ratios that divide by zero are set to missing.
 
-**Attribution.** Ensemble mean |SHAP| on the holdout, computed over the unanimous core ([step 05](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/05_evaluate_ensemble.html)), splits as follows: 76% optical, 14% site, and 10% weather. The top features are `BG` (0.48 m), `green_corr7` (0.48 m), `BR` (0.25 m), `MNDWI` (0.23 m), `fai` (0.18 m), and `catchment_area_sqkm` (0.15 m).
+**Attribution.** Ensemble mean |SHAP| on the holdout, computed over the unanimous core ([step 05](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/05_evaluate_ensemble.html)), splits as follows: 73% optical, 18% site, and 9% weather. The top features are `BG` (0.48 m), `green_corr7` (0.46 m), `BR` (0.25 m), `MNDWI` (0.23 m), `fai` (0.17 m), and `catchment_area_sqkm` (0.15 m).
 
 ## Evaluation
 
@@ -226,32 +223,32 @@ Predictions are averaged to one per site-date before scoring (1,833 site-dates f
 
 | Metric | Value |
 |---|---|
-| RMSE | 1.259 m |
-| MAE | 0.940 m |
-| Bias (predicted − observed) | +0.148 m |
-| R² | 0.626 |
-| MAPE | 41.5% |
+| RMSE | 1.257 m |
+| MAE | 0.941 m |
+| Bias (predicted − observed) | +0.152 m |
+| R² | 0.627 |
+| MAPE | 41.9% |
 | sMAPE | 31.8% |
 
 Error grows with water clarity. Below 4 m, the model runs high by about 0.4–0.6 m. From 4 to 6 m it is close to unbiased. Above 6 m, predictions are compressed toward the regional mean:
 
 | Observed SDD | n | RMSE (m) | Bias (m) |
 |---|---|---|---|
-| 0–2 m | 616 | 1.00 | +0.57 |
+| 0–2 m | 616 | 1.01 | +0.59 |
 | 2–4 m | 671 | 1.07 | +0.41 |
-| 4–6 m | 385 | 1.20 | −0.09 |
-| 6–10 m | 148 | 2.30 | −1.86 |
-| > 10 m | 13 | 3.64 | −3.42 |
+| 4–6 m | 385 | 1.19 | −0.10 |
+| 6–10 m | 148 | 2.30 | −1.87 |
+| > 10 m | 13 | 3.67 | −3.45 |
 
 ### Robustness
 
-- **Choice of holdout.** Holdout RMSE depends on which basins are held out. The same 10 seed configurations were retrained against 16 different holdout draws ([step 06](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/06_test_set_sensitivity.html)). Holdout RMSE across those draws ranged from 1.01 to 1.98 m (mean 1.46 m, SD 0.26 m). The production holdout sits at the 19th percentile of that range, so 1.26 m is on the favorable side of what to expect for a new set of basins. Most of the spread comes from how much of Lake Powell falls in the holdout.
+- **Choice of holdout.** Holdout RMSE depends on which basins are held out. The same 10 seed configurations were retrained against 16 different holdout draws ([step 06](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/06_test_set_sensitivity.html)). Holdout RMSE across those draws ranged from 1.01 to 1.99 m (mean 1.46 m, SD 0.27 m). The production holdout sits at the 19th percentile of that range, so 1.26 m is on the favorable side of what to expect for a new set of basins. Most of the spread comes from how much of Lake Powell falls in the holdout.
 - **Seed-to-seed spread.** For the typical holdout prediction, the per-point standard deviation across the 10 seeds is 0.12 m, and pairwise correlation between seeds is 0.99, so the members agree closely.
-- **CV vs. holdout.** Mean out-of-fold CV RMSE across seeds is 1.47 m (range 1.43–1.53 m), within the range of the holdout draws above.
+- **CV vs. holdout.** Mean out-of-fold CV RMSE across seeds is 1.47 m (range 1.44–1.53 m), within the range of the holdout draws above.
 
 ### Superseded matchups
 
-An SDD sample often has more than one image within ±5 days. Training kept only the closest image, so the other images were never used in training (at CV-pool sites they share SDD samples with training matchups). Of 2,811 such matchups, 2,714 pass every applicability check. On those, RMSE is 1.20 m (bias +0.03 m, R² 0.72). At holdout sites only, RMSE is 1.39 m (n = 582, R² 0.61) ([step 07](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07_regional_application.html)).
+An SDD sample often has more than one image within ±5 days. Training kept only the closest image, so the other images were never used in training (at CV-pool sites they share SDD samples with training matchups). Of 2,811 such matchups, 2,715 pass every applicability check. On those, RMSE is 1.19 m (bias +0.03 m, R² 0.72). At holdout sites only, RMSE is 1.38 m (n = 582, R² 0.61) ([step 07](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07_regional_application.html)).
 
 ## Applicability checks
 
@@ -262,16 +259,23 @@ An estimate should be used only when it passes all of the checks that [step 07](
 3. The day of year is between 70 and 320, the central 98% of training matchups.
 4. Every model input is available.
 5. Every input falls within the training range.
-6. The observation is inside the area of applicability (AOA; Meyer & Pebesma 2021). The dissimilarity index (DI) is computed in standardized feature space over the unanimous core, with each feature weighted by its ensemble mean |SHAP|. The threshold is DI ≤ 0.385, the upper whisker of the training pool's cross-fold nearest-neighbor DI.
+6. The observation is inside the area of applicability (AOA; Meyer & Pebesma 2021). The dissimilarity index (DI) is computed in standardized feature space over the unanimous core, with each feature weighted by its ensemble mean |SHAP|. The threshold is DI ≤ 0.394, the upper whisker of the training pool's cross-fold nearest-neighbor DI.
 7. The estimate is no shallower than the training minimum (0.1 m).
 
-Across the region, 88% of QA-passing location-days pass every check. Step 07 writes the AOA threshold, mean training distance, AOA features, and seasonal window to `aoa_parameters.json`.
+Across the region, 89% of QA-passing location-days pass every check.
+
+Checks 2–7 can be run on new data without the training data. `check_applicability()` in [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) applies them cumulatively and returns a pass/fail column for each check and the DI. It reads two files that step 07 writes to `applicability/`:
+
+- `aoa_parameters.json` contains the AOA threshold and the mean pairwise training distance (`d_bar`). It also has each AOA feature's standardization center, scale, and |SHAP| weight; the training minimum and maximum of every model input; the seasonal window; the training missions; and the training minimum SDD.
+- `aoa_reference.csv` contains the 8,926 CV-pool matchups with every AOA feature available, already standardized and weighted. A new observation's DI is its distance to the nearest row, divided by `d_bar`.
+
+Check 1, scene QA, has to be applied upstream when the reflectance data are prepared.
 
 ## Limitations
 
-- **Clear-water compression.** Above about 6 m SDD, water-leaving reflectance is weak relative to the noise floor of atmospheric correction. Like other Landsat clarity models, this model regresses toward the mean in that range, with a bias of about −1.9 m at 6–10 m and about −3.4 m above 10 m. Trends in very clear lakes will be damped.
+- **Clear-water compression.** Above about 6 m SDD, water-leaving reflectance is weak relative to the noise floor of atmospheric correction. Like other Landsat clarity models, this model regresses toward the mean in that range, with a bias of about −1.9 m at 6–10 m and about −3.5 m above 10 m. Trends in very clear lakes will be damped.
 - **Sparsely sampled, distinctive waterbodies.** Lake Powell is a very large, deep reservoir whose clarity varies widely between years. The deep, forested-catchment lakes of the Kootenai–Pend Oreille–Spokane basin (HUC4 1701), such as Flathead Lake and Lake Pend Oreille, sit in sparse tails of the training distribution. These two groups account for a large share of the clearest observations and of the error. The errors reflect real physical regimes, not bad data.
-- **Shallow, turbid water.** Below 2 m SDD, predictions are biased high by about 0.5 m.
+- **Shallow, turbid water.** Below 2 m SDD, predictions are biased high by about 0.6 m.
 - **Point estimates only.** The ensemble spread (about 0.12 m) reflects model variance, not total predictive uncertainty. Typical error is about 1.3 m, and up to about 2 m for unfavorable sets of basins.
 - **Static catchment features.** Land cover is fixed at NLCD 2006 for all dates, so land-use change is not represented.
 - **Sensor balance.** Landsat 8/9 make up 15% of training matchups. Landsat 4 contributes only 48 matchups.

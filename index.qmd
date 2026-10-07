@@ -14,7 +14,7 @@ This site presents the workflow behind the regional Secchi disc depth (SDD) mode
 
 The [model card](model_card.qmd) summarizes the production model: intended use, training data, performance, applicability checks, and limitations.
 
-Data preparation and application run in R. Modeling runs in Python notebooks that share the modules in `regional_clarity/python/`. Arrows are labeled with the main file each step hands to the next.
+Data preparation and application run in R. Modeling runs in Python notebooks that share the modules in `regional_clarity/python/`. Step 07 sources the R functions in `regional_clarity/R/`. Arrows are labeled with the main file each step hands to the next.
 
 ```{mermaid}
 %%| file: pipeline_diagram.mmd
@@ -34,6 +34,17 @@ Data preparation and application run in R. Modeling runs in Python notebooks tha
 | 07 | [Regional application](regional_clarity/07_regional_application.Rmd) | Apply the ensemble at in situ SDD locations, with training-domain and AOA checks. |
 
 Source code: [rossyndicate/regional-clarity-RS-model](https://github.com/rossyndicate/regional-clarity-RS-model).
+
+## Applying the model to your own data
+
+The production model folder holds only the fitted ensemble and the files the applicability checks need. It is tracked in the repository under `regional_clarity/xg_models/v3_production/` and published on the [Hugging Face Hub](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat). The code for applying the model lives in the source repository:
+
+| File | Language | What it does |
+|---|---|---|
+| [`regional_clarity/R/prepare_model_inputs.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/prepare_model_inputs.R) | R | Build model inputs from AquaMatch siteSR sites and QA'd observations: elevation, LakeCat catchment metrics, gridMET antecedent weather, spectral indices, and site-feature coarsening. [Step 07](regional_clarity/07_regional_application.Rmd) uses the same functions. |
+| [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) | Python | Load the 40-booster ensemble, predict SDD, and run the applicability checks against the model folder's `applicability/` files. |
+
+The [model card](model_card.qmd#how-to-use) has a worked example.
 
 ## How to cite
 

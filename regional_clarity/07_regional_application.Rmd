@@ -9,7 +9,7 @@ output: html_document
 
 - **Purpose:** Apply the production ensemble to every Landsat observation at in situ SDD locations, apply the training-domain and area-of-applicability checks, and validate on the superseded matchups.
 - **Inputs:** `aquamatch_files/`: `sdd_quality_filter.parquet`, `siteSR_DSWE1_regional_band_filtered.parquet`, `base_with_splits.parquet`, `regional_sdd_not_closest.parquet`, `site_characteristics.feather`, `downloads/siteSR_DSWE1_LS7corr.parquet`; `xg_models/v3_production/` (fold models, `ensemble_mean_abs_shap.csv`).
-- **Outputs:** `aquamatch_files/application/`: `application_rs_estimates.parquet`, `application_filter_steps.csv`, `aoa_parameters.json`, `superseded_validation.csv`, and cached fetches.
+- **Outputs:** `aquamatch_files/application/`: `application_rs_estimates.parquet`, `application_filter_steps.csv`, `superseded_validation.csv`, and cached fetches; `xg_models/v3_production/applicability/`: `aoa_parameters.json`, `aoa_reference.csv`.
 - **Previous:** [06 · Test-set sensitivity](06_test_set_sensitivity.ipynb) · **Used by:** `asv2_manuscript/manuscript_tables_figures.Rmd`
 
 This script applies the production 10-seed XGBoost ensemble
@@ -67,22 +67,23 @@ knitr::opts_chunk$set(echo = TRUE)
 
 Load packages and define the run constants: input paths, the production
 model directory and its 10 ensemble seeds (601–610), the output and cache
-directory, the cache-refresh switch, and the catchment-area winsorizing cap,
-which is shared with the Python feature code.
+directory, and the cache-refresh switch. The model-input functions (site
+characteristics, gridMET weather, feature engineering) come from
+`R/prepare_model_inputs.R`, which end users call to prepare their own data, so
+the application below runs the same code.
 
 ```{r libraries, message=FALSE, warning=FALSE}
 library(arrow)
 library(tidyverse)
 library(sf)
 library(igraph)
-library(elevatr)
-library(StreamCatTools)
-library(parallel)
-library(climateR)
-library(data.table)
 library(xgboost)
 library(jsonlite)
 library(RANN)
+
+# model-input assembly shared with end users (site characteristics, gridMET
+# weather, feature engineering); see the file header
+source("regional_clarity/R/prepare_model_inputs.R")
 
 log <- function(...) cat(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")), sprintf(...), "\n")
 
@@ -98,9 +99,6 @@ ENSEMBLE_SEEDS <- 601:610
 OUT_DIR <- file.path(AQUAMATCH_DIR, "application")
 dir.create(OUT_DIR, showWarnings = FALSE)
 FORCE_REFRESH_CACHE <- FALSE
-
-# identical to python/features.py; see CATCHMENT_WINSORIZE_CAP_SQKM there
-CATCHMENT_WINSORIZE_CAP_SQKM <- 617.1
 N_WORKERS <- 8
 ```
 
@@ -231,58 +229,11 @@ remaining sites are fetched. `shore_flag` uses the definition from
 site_char_cache <- file.path(OUT_DIR, "application_site_characteristics.feather")
 qa_sites <- station_sites %>% filter(siteSR_id %in% unique(sitesr_qa$siteSR_id))
 
-stopifnot("some sites resolve to a non-NHDPlusv2 waterbody source - LakeCat join is not safe as-is" =
-            all(qa_sites$wb_nhd_source == "NHDPlusv2" | is.na(qa_sites$wb_nhd_source)))
-
 if (!FORCE_REFRESH_CACHE && file.exists(site_char_cache)) {
   site_char <- read_feather(site_char_cache)
 } else {
-  existing <- read_feather(file.path(AQUAMATCH_DIR, "site_characteristics.feather")) %>%
-    filter(siteSR_id %in% qa_sites$siteSR_id) %>%
-    select(siteSR_id, elevation_m, catchment_area_sqkm, starts_with("pct_"))
-  to_fetch <- qa_sites %>% filter(!siteSR_id %in% existing$siteSR_id)
-  log("site characteristics: %s cached from training, %s to fetch", nrow(existing), nrow(to_fetch))
-
-  pts_sf <- st_as_sf(to_fetch, coords = c("WGS84_Longitude", "WGS84_Latitude"), crs = 4326)
-  elev <- get_elev_point(pts_sf, src = "aws", z = 9) %>%
-    st_drop_geometry() %>%
-    select(siteSR_id, elevation_m = elevation)
-
-  lakecat_metrics <- paste(c(
-    "pctimp2006", "pcturbhi2006", "pcturblo2006", "pcturbmd2006", "pcturbop2006",
-    "pctconif2006", "pctdecid2006", "pctmxfst2006",
-    "pcthbwet2006", "pctwdwet2006", "pctcrop2006"
-  ), collapse = ",")
-  comids <- unique(na.omit(as.character(to_fetch$wb_nhd_id)))
-  chunks <- split(comids, ceiling(seq_along(comids) / 200))
-  # a chunk where none of the comids are LakeCat-covered throws rather than
-  # returning empty, so catch per chunk
-  lakecat <- map(chunks, \(ch) {
-    tryCatch(lc_get_data(comid = paste(ch, collapse = ","), metric = lakecat_metrics,
-                         aoi = "catchment", showAreaSqKm = TRUE),
-             error = function(e) { log("LakeCat chunk failed: %s", conditionMessage(e)); tibble() })
-  }) %>%
-    list_rbind() %>%
-    mutate(comid = as.character(comid),
-           pct_forest_2006 = pctconif2006cat + pctdecid2006cat + pctmxfst2006cat,
-           pct_wetland_2006 = pcthbwet2006cat + pctwdwet2006cat,
-           pct_urban_2006 = pcturbhi2006cat + pcturblo2006cat + pcturbmd2006cat + pcturbop2006cat) %>%
-    select(comid, catchment_area_sqkm = catareasqkm,
-           pct_impervious_2006 = pctimp2006cat, pct_urban_2006, pct_forest_2006,
-           pct_cropland_2006 = pctcrop2006cat, pct_wetland_2006)
-
-  fetched <- to_fetch %>%
-    mutate(comid = as.character(wb_nhd_id)) %>%
-    select(siteSR_id, comid) %>%
-    left_join(elev, by = "siteSR_id") %>%
-    left_join(lakecat, by = "comid") %>%
-    select(-comid)
-
-  site_char <- bind_rows(existing, fetched) %>%
-    left_join(qa_sites %>%
-                transmute(siteSR_id,
-                          shore_flag = as.numeric(flag_wb == 1 | flag_optical_shoreline == 1)),
-              by = "siteSR_id")
+  site_char <- fetch_site_characteristics(
+    qa_sites, existing = read_feather(file.path(AQUAMATCH_DIR, "site_characteristics.feather")))
   write_feather(site_char, site_char_cache)
 }
 
@@ -298,26 +249,8 @@ Rolling summaries follow `02c_pull_weather_summaries.Rmd` and cover the *w* days
 strictly before the image date.
 
 ```{r gridmet-cells}
-GRIDMET_RES <- 1 / 24
-GRIDMET_LON0 <- -124.766666666667  # westernmost cell center
-GRIDMET_LAT0 <- 49.4               # northernmost cell center
-MAX_WINDOW_DAYS <- 30
-WINDOWS <- c(1, 3, 7, 30)
-VARS <- c("pr", "tmmx", "tmmn", "srad")
-
-site_cells <- qa_sites %>%
-  transmute(siteSR_id,
-            col = round((WGS84_Longitude - GRIDMET_LON0) / GRIDMET_RES),
-            row = round((GRIDMET_LAT0 - WGS84_Latitude) / GRIDMET_RES),
-            cell_id = paste(col, row, sep = "_"),
-            cell_lon = GRIDMET_LON0 + col * GRIDMET_RES,
-            cell_lat = GRIDMET_LAT0 - row * GRIDMET_RES)
-
-cell_ranges <- sitesr_qa %>%
-  distinct(siteSR_id, date) %>%
-  inner_join(site_cells, by = "siteSR_id") %>%
-  summarise(min_date = min(date) - (MAX_WINDOW_DAYS + 5), max_date = max(date),
-            .by = c(cell_id, cell_lon, cell_lat))
+site_cells <- gridmet_cells(qa_sites)
+cell_ranges <- gridmet_cell_ranges(sitesr_qa, site_cells)
 
 log("%s sites fall in %s gridMET cells", nrow(site_cells), nrow(cell_ranges))
 ```
@@ -333,36 +266,9 @@ weather_raw_cache <- file.path(OUT_DIR, "application_weather_raw.feather")
 if (!FORCE_REFRESH_CACHE && file.exists(weather_raw_cache)) {
   weather_raw <- read_feather(weather_raw_cache)
 } else {
-  fetch_one <- function(i, cell_ranges, VARS) {
-    row <- cell_ranges[i, ]
-    fetch <- function() {
-      pt <- sf::st_as_sf(data.frame(lon = row$cell_lon, lat = row$cell_lat),
-                         coords = c("lon", "lat"), crs = 4326)
-      res <- climateR::getGridMET(AOI = pt, varname = VARS,
-                                  startDate = as.character(row$min_date),
-                                  endDate = as.character(row$max_date))
-      res$cell_id <- row$cell_id
-      res
-    }
-    tryCatch(fetch(), error = function(e) {
-      Sys.sleep(5)
-      tryCatch(fetch(), error = function(e2) data.frame(cell_id = row$cell_id, error = conditionMessage(e2)))
-    })
-  }
-
-  t0 <- Sys.time()
-  cl <- makeCluster(N_WORKERS, type = "PSOCK")
-  clusterEvalQ(cl, { suppressMessages(library(climateR)); suppressMessages(library(sf)) })
-  results <- parLapply(cl, seq_len(nrow(cell_ranges)), fetch_one,
-                       cell_ranges = cell_ranges, VARS = VARS)
-  stopCluster(cl)
-  log("gridMET fetch took %.1f min", as.numeric(difftime(Sys.time(), t0, units = "mins")))
-
-  failed <- Filter(function(x) "error" %in% names(x), results)
-  log("succeeded: %s cells, failed: %s cells", length(results) - length(failed), length(failed))
-  if (length(failed) > 0) write_csv(bind_rows(failed), file.path(OUT_DIR, "gridmet_fetch_failures.csv"))
-
-  weather_raw <- bind_rows(Filter(function(x) !"error" %in% names(x), results))
+  fetched <- fetch_gridmet(cell_ranges, n_workers = N_WORKERS)
+  if (nrow(fetched$failed) > 0) write_csv(fetched$failed, file.path(OUT_DIR, "gridmet_fetch_failures.csv"))
+  weather_raw <- fetched$weather
   write_feather(weather_raw, weather_raw_cache)
 }
 ```
@@ -377,30 +283,9 @@ before the image date.
 weather_summary_cache <- file.path(OUT_DIR, "application_weather_summaries.feather")
 
 if (!FORCE_REFRESH_CACHE && file.exists(weather_summary_cache)) {
-  weather_summaries <- as.data.table(read_feather(weather_summary_cache))
+  weather_summaries <- read_feather(weather_summary_cache)
 } else {
-  weather <- as.data.table(weather_raw)[, .(cell_id, date = as.Date(date),
-                                             precip_mm = pr,
-                                             tmax_degC = tmmx - 273.15,
-                                             tmin_degC = tmmn - 273.15,
-                                             srad_Wm2 = srad)]
-  weather[, tmean_degC := (tmax_degC + tmin_degC) / 2]
-
-  # regular daily series per cell, so the rolling windows count calendar days
-  full_days <- weather[, .(date = seq(min(date), max(date), by = "1 day")), by = cell_id]
-  weather <- weather[full_days, on = .(cell_id, date)]
-  setorder(weather, cell_id, date)
-
-  for (w in WINDOWS) {
-    weather[, paste0("precip_mm_prev", w) := frollsum(precip_mm, n = w), by = cell_id]
-    weather[, paste0("tmax_degC_prev", w) := frollmax(tmax_degC, n = w), by = cell_id]
-    weather[, paste0("tmean_degC_prev", w) := frollmean(tmean_degC, n = w), by = cell_id]
-    weather[, paste0("tmin_degC_prev", w) := -frollmax(-tmin_degC, n = w), by = cell_id]
-    weather[, paste0("srad_Wm2_prev", w) := frollmean(srad_Wm2, n = w), by = cell_id]
-  }
-  # shift so window w on `date` covers the w days strictly BEFORE date
-  weather[, date := date + 1]
-  weather_summaries <- weather[, c("cell_id", "date", grep("_prev", names(weather), value = TRUE)), with = FALSE]
+  weather_summaries <- summarize_weather(weather_raw)
   write_feather(as.data.frame(weather_summaries), weather_summary_cache)
 }
 log("weather summaries: %s cell-days", nrow(weather_summaries))
@@ -412,30 +297,8 @@ The band columns in the QA'd siteSR file are already harmonized to Landsat 7
 (Gardner et al.; `*_corr_7`). Spectral indices and the coarsening of site
 features are R ports of `python/features.py` (`add_spectral_indices()` and
 `coarsen_site_features()`). The same function is applied to the training data
-below, so the applicability checks compare like with like.
-
-```{r feature-functions}
-TRAINING_MISSIONS <- c("LT04", "LT05", "LE07", "LC08", "LC09")
-
-add_features <- function(df) {
-  df %>%
-    mutate(BR = blue_corr7 / red_corr7,
-           BG = blue_corr7 / green_corr7,
-           NR = nir_corr7 / red_corr7,
-           GR = green_corr7 / red_corr7,
-           fai = nir_corr7 - (red_corr7 + (swir1_corr7 - red_corr7) * ((830 - 660) / (1650 - 660))),
-           NDVI = (nir_corr7 - red_corr7) / (nir_corr7 + red_corr7),
-           NDSSI = (blue_corr7 - nir_corr7) / (blue_corr7 + nir_corr7),
-           NDWI = (green_corr7 - nir_corr7) / (green_corr7 + nir_corr7),
-           MNDWI = (green_corr7 - swir1_corr7) / (green_corr7 + swir1_corr7)) %>%
-    mutate(across(c(BR, BG, NR, GR, fai, NDVI, NDSSI, NDWI, MNDWI), ~ if_else(is.finite(.x), .x, NA_real_)),
-           catchment_area_sqkm = if_else(catchment_area_sqkm > 0,
-                                         10^round(log10(pmin(catchment_area_sqkm, CATCHMENT_WINSORIZE_CAP_SQKM)), 1),
-                                         catchment_area_sqkm),
-           across(c(pct_impervious_2006, pct_urban_2006, pct_forest_2006,
-                    pct_cropland_2006, pct_wetland_2006), ~ round(.x, 0)))
-}
-```
+below, so the applicability checks compare like with like. Both are defined
+in `R/prepare_model_inputs.R` (`add_features()`).
 
 Build one model-input row per QA'd siteSR observation. Each row combines
 the harmonized bands, a flag for Landsat 8/9 atmospheric correction
@@ -444,19 +307,8 @@ gridMET cell on the image date. Spectral indices and coarsened site
 features are then added.
 
 ```{r assemble}
-model_input <- sitesr_qa %>%
-  select(siteSR_id, location_id, date, mission,
-         red_corr7 = red_corr_7, green_corr7 = green_corr_7, blue_corr7 = blue_corr_7,
-         nir_corr7 = nir_corr_7, swir1_corr7 = swir1_corr_7, swir2_corr7 = swir2_corr_7,
-         temp_corr7 = surfacetemp_corr_7) %>%
-  mutate(atm_corr_LaSRC = as.integer(mission %in% c("LC08", "LC09"))) %>%
-  left_join(site_char, by = "siteSR_id") %>%
-  left_join(site_cells %>% select(siteSR_id, cell_id), by = "siteSR_id") %>%
-  left_join(as.data.frame(weather_summaries), by = c("cell_id", "date")) %>%
-  add_features() %>%
-  # the data.table class carries through the join otherwise, which breaks
-  # plain `df[, feats]` column selection below
-  as_tibble()
+model_input <- assemble_model_inputs(sitesr_qa, site_char, site_cells, weather_summaries,
+                                     keep = "location_id")
 
 log("model input: %s rows", nrow(model_input))
 ```
@@ -678,9 +530,19 @@ Write the application outputs:
 - the per-location-day remote sensing estimates;
 - the in situ location-days for comparison;
 - location coordinates;
-- per-row pass/fail flags for every check;
-- the AOA threshold, mean training distance, AOA features, and seasonal
-  window, saved as JSON so the same checks can be reproduced elsewhere.
+- per-row pass/fail flags for every check.
+
+The applicability checks themselves are written alongside the model, to
+`xg_models/v3_production/applicability/`, so anyone applying the model can
+screen their own observations without the training data:
+
+- `aoa_parameters.json`: the AOA threshold and mean training distance; the
+  AOA features with their standardization centers, scales, and |SHAP|
+  weights; the training range of every model input; the seasonal window; the
+  training missions; and the training minimum SDD;
+- `aoa_reference.csv`: the training reference already transformed into AOA
+  space (standardized and weighted), one row per CV-pool matchup, which is
+  what a new observation's nearest-neighbor distance is measured against.
 
 ```{r export}
 locations <- station_sites %>%
@@ -693,10 +555,22 @@ write_parquet(locations, file.path(OUT_DIR, "application_locations.parquet"))
 write_parquet(model_input %>%
                 select(location_id, date, mission, pass_mission, pass_season, pass_complete, pass_range, pass_aoa, pass_plausible, di),
               file.path(OUT_DIR, "application_row_flags.parquet"))
-write_json(list(aoa_threshold = aoa_threshold, d_bar = d_bar, aoa_features = aoa_feats,
-                season_window_doy = unname(season_window)),
-           file.path(OUT_DIR, "aoa_parameters.json"), auto_unbox = TRUE, digits = NA)
 log("wrote application outputs to %s", OUT_DIR)
+
+APPLICABILITY_DIR <- file.path(MODEL_DIR, "applicability")
+dir.create(APPLICABILITY_DIR, showWarnings = FALSE)
+write_json(list(aoa_threshold = aoa_threshold,
+                d_bar = d_bar,
+                aoa_features = tibble(feature = aoa_feats, center = centers,
+                                      scale = scales, weight = weights),
+                feature_ranges = feature_ranges,
+                season_window_doy = unname(season_window),
+                training_missions = TRAINING_MISSIONS,
+                min_training_sdd_m = min(train_pool$harmonized_value)),
+           file.path(APPLICABILITY_DIR, "aoa_parameters.json"),
+           auto_unbox = TRUE, digits = I(17), pretty = TRUE)
+write_csv(as_tibble(train_X), file.path(APPLICABILITY_DIR, "aoa_reference.csv"))
+log("wrote applicability checks to %s", APPLICABILITY_DIR)
 ```
 
 ## Model performance on superseded matchups
