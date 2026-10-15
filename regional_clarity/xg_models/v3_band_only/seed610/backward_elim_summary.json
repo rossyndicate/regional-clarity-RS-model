@@ -1,0 +1,123 @@
+{
+  "starting_candidates": [
+    "atm_corr_LaSRC",
+    "red_corr7",
+    "green_corr7",
+    "blue_corr7",
+    "nir_corr7",
+    "swir1_corr7",
+    "swir2_corr7",
+    "temp_corr7",
+    "BR",
+    "BG",
+    "NR",
+    "GR",
+    "fai",
+    "NDVI",
+    "NDSSI",
+    "NDWI",
+    "MNDWI"
+  ],
+  "correlation_pruned": [
+    "atm_corr_LaSRC",
+    "green_corr7",
+    "nir_corr7",
+    "swir1_corr7",
+    "temp_corr7",
+    "BR",
+    "BG",
+    "NR",
+    "fai",
+    "NDVI",
+    "NDSSI",
+    "NDWI",
+    "MNDWI"
+  ],
+  "final_features": [
+    "atm_corr_LaSRC",
+    "green_corr7",
+    "nir_corr7",
+    "swir1_corr7",
+    "temp_corr7",
+    "BR",
+    "BG",
+    "NR",
+    "fai",
+    "NDVI",
+    "NDSSI",
+    "NDWI",
+    "MNDWI"
+  ],
+  "path": [
+    {
+      "step": 0,
+      "n_features": 13,
+      "mean_cv_rmse": 1.5793134569903675,
+      "shadow_floor": 0.0006062178700153575,
+      "features": [
+        "atm_corr_LaSRC",
+        "green_corr7",
+        "nir_corr7",
+        "swir1_corr7",
+        "temp_corr7",
+        "BR",
+        "BG",
+        "NR",
+        "fai",
+        "NDVI",
+        "NDSSI",
+        "NDWI",
+        "MNDWI"
+      ],
+      "real_importance": {
+        "atm_corr_LaSRC": 0.009277684272458306,
+        "green_corr7": 0.24794409110425142,
+        "nir_corr7": 0.011928998907180669,
+        "swir1_corr7": -0.0024854573758384033,
+        "temp_corr7": 0.004002580848383119,
+        "BR": 0.09912231142479484,
+        "BG": 0.24977711441217867,
+        "NR": 0.02144511204229486,
+        "fai": 0.060162656144542935,
+        "NDVI": 0.009119313977675162,
+        "NDSSI": 0.009336334062878796,
+        "NDWI": 0.004658280239758783,
+        "MNDWI": 0.056674048823373104
+      }
+    },
+    {
+      "step": 1,
+      "n_features": 12,
+      "mean_cv_rmse": 1.5800634598868628,
+      "shadow_floor": 0.00034602714431686277,
+      "features": [
+        "atm_corr_LaSRC",
+        "green_corr7",
+        "nir_corr7",
+        "temp_corr7",
+        "BR",
+        "BG",
+        "NR",
+        "fai",
+        "NDVI",
+        "NDSSI",
+        "NDWI",
+        "MNDWI"
+      ],
+      "real_importance": {
+        "atm_corr_LaSRC": 0.01033197742624801,
+        "green_corr7": 0.2470239005897276,
+        "nir_corr7": 0.007068558945999466,
+        "temp_corr7": 0.005363771377476141,
+        "BR": 0.10839741283408105,
+        "BG": 0.2552035962575297,
+        "NR": 0.026459079334892905,
+        "fai": 0.04040670776383672,
+        "NDVI": 0.0110647238890658,
+        "NDSSI": 0.00969701696952091,
+        "NDWI": 0.006552355432442554,
+        "MNDWI": 0.07161805349085452
+      }
+    }
+  ]
+}

@@ -1,28 +1,39 @@
-"""Apply the production SDD ensemble and its applicability checks.
+"""Apply an SDD ensemble and its applicability checks.
 
-`model_dir` is the production model folder: a download of the Hugging Face
-model repository, or `xg_models/v3_production/` in this repository. `X` is
-one row per observation with every model input already engineered, as
-returned by `prepare_model_inputs()` in `R/prepare_model_inputs.R` (or, for
-inputs built in Python, after `add_spectral_indices()` and
-`coarsen_site_features()` from `features.py`).
+`model_dir` is a model folder: a download of one of the Hugging Face model
+repositories, or `xg_models/v3_production/` (production) or
+`xg_models/v3_band_only/` (band-only) in this repository. Predict and screen
+with the same folder; each model's applicability files are its own.
+
+`X` is one row per observation with every model input already engineered,
+as returned by `prepare_model_inputs()` in `R/prepare_model_inputs.R` (with
+`site_and_weather = FALSE` for the band-only model), or, for inputs built in
+Python, after `add_spectral_indices()` and `coarsen_site_features()` from
+`features.py`.
 
     from apply_model import load_ensemble, predict_sdd, check_applicability
 
     members = load_ensemble(model_dir)
     X["pred_sdd"] = predict_sdd(members, X)
     flags = check_applicability(X, model_dir, pred_sdd=X["pred_sdd"])
-    usable = X[flags["pass_all"]]
+    in_domain = X[flags["pass_all"]]
 
-The checks mirror step 07 (07_regional_application.Rmd), which writes the
-`applicability/` files this module reads. Scene QA (check 1 in the model
-card) has to be applied upstream and is not repeated here.
+The checks mirror steps 07 and 07b (07_regional_application.Rmd and
+07b_regional_application_band_only.Rmd), which write the `applicability/`
+files this module reads. Scene QA (check 1 in the model cards) has to be
+applied upstream and is not repeated here.
+
+A failed check flags an observation as outside the conditions the model was
+trained on, where its estimate is an extrapolation and may be poor; it does
+not by itself make the estimate unusable. `di` and `out_of_range` say how far
+outside, so users can set their own cutoff.
 """
 import json
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import shapely
 import xgboost as xgb
 from scipy.spatial import cKDTree
 
@@ -45,11 +56,23 @@ def predict_sdd(members, X):
 
 
 def load_applicability(model_dir):
-    """Read the AOA parameters and the training reference in AOA space."""
+    """Read the AOA parameters, the training reference in AOA space, and the
+    training region footprint."""
     app_dir = Path(model_dir) / "applicability"
     params = json.loads((app_dir / "aoa_parameters.json").read_text())
     reference = pd.read_csv(app_dir / "aoa_reference.csv")
-    return params, reference
+    region = shapely.from_geojson((app_dir / "training_region.geojson").read_text())
+    return params, reference, region
+
+
+def in_training_region(X, region):
+    """True where the site (WGS84_Longitude, WGS84_Latitude) falls inside the
+    training region: the HUC4 basins scoped in 01_filter_AquaMatch_Data.Rmd,
+    simplified to 30 m. Points on the boundary count as inside, as in 01's
+    spatial join."""
+    region = shapely.union_all(shapely.get_parts(region))
+    return shapely.intersects_xy(region, X["WGS84_Longitude"].to_numpy(float),
+                                 X["WGS84_Latitude"].to_numpy(float))
 
 
 def dissimilarity_index(X, params, reference):
@@ -67,28 +90,42 @@ def dissimilarity_index(X, params, reference):
     return di
 
 
-def check_applicability(X, model_dir, pred_sdd=None):
-    """Per-row pass/fail for each step 07 check, applied cumulatively.
+def check_applicability(X, model_dir, pred_sdd=None, aoa_threshold=None):
+    """Per-row pass/fail for each step 07 check, applied cumulatively, plus
+    how far each row sits from the training data.
 
-    `X` needs `date` and `mission` (LT04, LT05, LE07, LC08, LC09) columns
-    plus every model input. Pass `pred_sdd` to include the plausibility
-    check; otherwise `pass_all` stops at the AOA check.
+    `X` needs `WGS84_Latitude`, `WGS84_Longitude`, `date`, and `mission`
+    (LT04, LT05, LE07, LC08, LC09) columns plus every model input. Pass
+    `pred_sdd` to include the plausibility check; otherwise `pass_all` stops
+    at the AOA check. `aoa_threshold` overrides the DI threshold in
+    `aoa_parameters.json`.
+
+    `di` is returned for every row with all AOA features present, whether or
+    not it passes; `out_of_range` names the inputs outside their training
+    range ("" when none).
     """
-    params, reference = load_applicability(model_dir)
+    params, reference, region = load_applicability(model_dir)
+    if aoa_threshold is None:
+        aoa_threshold = params["aoa_threshold"]
     ranges = pd.DataFrame(params["feature_ranges"])
     doy = pd.to_datetime(X["date"]).dt.dayofyear
     lo, hi = params["season_window_doy"]
 
     out = pd.DataFrame(index=X.index)
-    out["pass_mission"] = X["mission"].isin(params["training_missions"])
+    out["pass_region"] = in_training_region(X, region)
+    out["pass_mission"] = out["pass_region"] & X["mission"].isin(params["training_missions"])
     out["pass_season"] = out["pass_mission"] & doy.between(lo, hi)
     out["pass_complete"] = out["pass_season"] & X[ranges["feature"]].notna().all(axis=1)
-    in_range = np.ones(len(X), dtype=bool)
-    for f, fmin, fmax in ranges[["feature", "min", "max"]].itertuples(index=False):
-        in_range &= X[f].between(fmin, fmax).to_numpy()
-    out["pass_range"] = out["pass_complete"] & in_range
+    outside = pd.DataFrame({f: ~X[f].between(fmin, fmax) & X[f].notna()
+                            for f, fmin, fmax in ranges[["feature", "min", "max"]].itertuples(index=False)},
+                           index=X.index)
+    names = np.full(len(X), "", dtype=object)
+    for f in outside.columns:
+        names = names + np.where(outside[f].to_numpy(), f + ",", "")
+    out["out_of_range"] = pd.Series(names, index=X.index, dtype=object).str.rstrip(",")
+    out["pass_range"] = out["pass_complete"] & ~outside.any(axis=1)
     out["di"] = dissimilarity_index(X, params, reference)
-    out["pass_aoa"] = out["pass_range"] & (out["di"] <= params["aoa_threshold"])
+    out["pass_aoa"] = out["pass_range"] & (out["di"] <= aoa_threshold)
     if pred_sdd is not None:
         out["pass_plausible"] = out["pass_aoa"] & (np.asarray(pred_sdd) >= params["min_training_sdd_m"])
         out["pass_all"] = out["pass_plausible"]

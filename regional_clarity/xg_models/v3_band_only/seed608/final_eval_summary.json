@@ -1,0 +1,48 @@
+{
+  "xgboost": {
+    "features": [
+      "atm_corr_LaSRC",
+      "green_corr7",
+      "nir_corr7",
+      "swir1_corr7",
+      "temp_corr7",
+      "BR",
+      "BG",
+      "NR",
+      "fai",
+      "NDVI",
+      "NDSSI",
+      "NDWI",
+      "MNDWI"
+    ],
+    "params": {
+      "eta": 0.01,
+      "max_depth": 2,
+      "min_child_weight": 7,
+      "subsample": 0.6,
+      "colsample_bytree": 0.4,
+      "reg_alpha": 0.1,
+      "reg_lambda": 20
+    },
+    "cv_metrics": {
+      "rmse": 1.580566767113511,
+      "mae": 1.0690068930203795,
+      "mape": 0.6300551266899218,
+      "bias": 0.02796657484693373,
+      "p_bias": 0.8546582335424924,
+      "smape": 0.3851470985481845,
+      "r2": 0.5946244347283571,
+      "n": 8937
+    },
+    "test_metrics": {
+      "rmse": 1.3701450950047378,
+      "mae": 1.0208045581239846,
+      "mape": 0.43609439904618114,
+      "bias": 0.11609986279568452,
+      "p_bias": 3.544582604933314,
+      "smape": 0.33571930400127736,
+      "r2": 0.546470489735825,
+      "n": 2206
+    }
+  }
+}

@@ -9,7 +9,7 @@ output: html_document
 
 - **Purpose:** Apply the production ensemble to every Landsat observation at in situ SDD locations, apply the training-domain and area-of-applicability checks, and validate on the superseded matchups.
 - **Inputs:** `aquamatch_files/`: `sdd_quality_filter.parquet`, `siteSR_DSWE1_regional_band_filtered.parquet`, `base_with_splits.parquet`, `regional_sdd_not_closest.parquet`, `site_characteristics.feather`, `downloads/siteSR_DSWE1_LS7corr.parquet`; `xg_models/v3_production/` (fold models, `ensemble_mean_abs_shap.csv`).
-- **Outputs:** `aquamatch_files/application/`: `application_rs_estimates.parquet`, `application_filter_steps.csv`, `superseded_validation.csv`, and cached fetches; `xg_models/v3_production/applicability/`: `aoa_parameters.json`, `aoa_reference.csv`.
+- **Outputs:** `aquamatch_files/application/`: `application_rs_estimates.parquet`, `application_filter_steps.csv`, `superseded_validation.csv`, and cached fetches; `xg_models/v3_production/applicability/`: `aoa_parameters.json`, `aoa_reference.csv`, `training_region.geojson`.
 - **Previous:** [06 · Test-set sensitivity](06_test_set_sensitivity.ipynb) · **Used by:** `asv2_manuscript/manuscript_tables_figures.Rmd`
 
 This script applies the production 10-seed XGBoost ensemble
@@ -18,25 +18,28 @@ region with quality-controlled in situ Secchi disc depth (SDD) data. It asks
 how many additional SDD observations remote sensing provides at those same
 locations.
 
-That number is not simply the siteSR row count. An estimate only counts if
-every one of these conditions holds:
+That number is not simply the siteSR row count. An estimate counts when the
+scene passes QA and the observation falls inside the model's training domain
+on every check:
 
 1. the scene passes the same siteSR QA used to build the training data
-   (`01_filter_AquaMatch_Data.Rmd`: geometry and regional HUC4 scoping, scene
-   metadata QA, and band RANSAC);
-2. it comes from a Landsat mission represented in training;
-3. it falls within the seasonal window of the training matchups (the central
+   (`01_filter_AquaMatch_Data.Rmd`, with the observation QA in
+   `R/siteSR_qa.R`: site geometry and regional HUC4 scoping, pixel,
+   temperature, and scene QA, and band RANSAC);
+2. the site falls inside the training region (the HUC4 footprint from 01);
+3. it comes from a Landsat mission represented in training;
+4. it falls within the seasonal window of the training matchups (the central
    98% of their day of year), which excludes ice-season scenes the model has
    effectively never seen;
-4. every model input (bands, LakeCat catchment metrics, gridMET antecedent
+5. every model input (bands, LakeCat catchment metrics, gridMET antecedent
    weather) is available;
-5. every feature falls within the range of the training data (the literal
+6. every feature falls within the range of the training data (the literal
    "training box");
-6. the observation falls inside the model's area of applicability (AOA;
+7. the observation falls inside the model's area of applicability (AOA;
    Meyer & Pebesma 2021), a multivariate dissimilarity check against the
    training data that is weighted by each feature's contribution to the model;
    and
-7. the estimate is physically plausible: no shallower than the shallowest SDD
+8. the estimate is physically plausible: no shallower than the shallowest SDD
    in the training data. Tree ensembles can return small negative values for
    very turbid water.
 
@@ -308,7 +311,8 @@ features are then added.
 
 ```{r assemble}
 model_input <- assemble_model_inputs(sitesr_qa, site_char, site_cells, weather_summaries,
-                                     keep = "location_id")
+                                     keep = "location_id") %>%
+  left_join(sites_meta %>% distinct(siteSR_id, WGS84_Latitude, WGS84_Longitude), by = "siteSR_id")
 
 log("model input: %s rows", nrow(model_input))
 ```
@@ -375,6 +379,33 @@ train_pool <- training %>% filter(!is_holdout)
 log("training reference: %s CV-pool rows", nrow(train_pool))
 ```
 
+### Training region
+
+The training data were scoped to the HUC4 basins that overlap the six-state
+region by at least half (`01_filter_AquaMatch_Data.Rmd`, "Regional AOI"). An
+observation passes when its site falls inside that footprint. The footprint is
+dissolved and simplified to 30 m (one Landsat pixel) so that it can ship with
+the model; points on its boundary count as inside, as in 01's spatial join.
+None of the other checks measures geographic distance, so a site in another
+region with familiar-looking conditions would otherwise pass. Every
+observation here was already scoped by 01, so this check removes nothing in
+this application; it exists for new data.
+
+```{r region-check}
+training_region <- st_read(file.path(AQUAMATCH_DIR, "huc4_filtered.gdb"), layer = "huc4_filtered", quiet = TRUE) %>%
+  st_make_valid() %>%
+  st_transform(5070) %>%
+  st_union() %>%
+  st_simplify(preserveTopology = TRUE, dTolerance = 30) %>%
+  st_transform(4326)
+
+in_region <- function(df) {
+  pts <- st_as_sf(df %>% select(WGS84_Longitude, WGS84_Latitude), coords = c("WGS84_Longitude", "WGS84_Latitude"),
+                  crs = 4326, na.fail = FALSE)
+  lengths(st_intersects(pts, training_region)) > 0
+}
+```
+
 ### Feature range ("training box")
 
 An observation passes when every model input used by any seed lies within the
@@ -395,6 +426,17 @@ in_range <- function(df) {
     ok <- ok & !is.na(x) & x >= feature_ranges$min[i] & x <= feature_ranges$max[i]
   }
   ok
+}
+
+# the inputs outside their training range, comma-separated ("" when none)
+out_of_range <- function(df) {
+  names_out <- rep("", nrow(df))
+  for (i in seq_len(nrow(feature_ranges))) {
+    x <- df[[feature_ranges$feature[i]]]
+    outside <- !is.na(x) & (x < feature_ranges$min[i] | x > feature_ranges$max[i])
+    names_out <- paste0(names_out, if_else(outside, paste0(feature_ranges$feature[i], ","), ""))
+  }
+  sub(",$", "", names_out)
 }
 
 feature_complete <- function(df) complete.cases(df[, model_feats])
@@ -481,6 +523,13 @@ log("AOA threshold (DI): %.3f", aoa_threshold)
 
 ## Apply the filters
 
+A failed check flags an observation as outside the conditions the model was
+trained on. Its estimate is then an extrapolation and may be poor, but it is
+not necessarily wrong. The counts below are of estimates inside the training
+domain on every check; the per-row flags, the DI, and the inputs outside their
+training range are exported with the estimates so that users can set their own
+cutoffs.
+
 Each step is counted in location-days: the number of distinct
 (location, date) pairs with at least one observation remaining. When more than
 one scene passes at a location on the same day (overlapping paths, or several
@@ -488,10 +537,12 @@ one scene passes at a location on the same day (overlapping paths, or several
 
 ```{r filter-steps}
 model_input <- model_input %>%
-  mutate(pass_mission = mission %in% TRAINING_MISSIONS,
+  mutate(pass_region = in_region(.),
+         pass_mission = pass_region & mission %in% TRAINING_MISSIONS,
          pass_season = pass_mission & in_season(.),
          pass_complete = pass_season & feature_complete(.),
          pass_range = pass_complete & in_range(.),
+         out_of_range = out_of_range(.),
          di = compute_di(.),
          pass_aoa = pass_range & !is.na(di) & di <= aoa_threshold,
          pass_plausible = pass_aoa & pred_sdd >= min(train_pool$harmonized_value))
@@ -504,6 +555,7 @@ count_step <- function(df, step) {
 filter_steps <- bind_rows(
   count_step(sitesr_raw_location_days, "siteSR observations (before QA)"),
   count_step(model_input, "After siteSR QA"),
+  count_step(filter(model_input, pass_region), "Inside training region"),
   count_step(filter(model_input, pass_mission), "Landsat mission represented in training"),
   count_step(filter(model_input, pass_season), "Within seasonal window of training matchups"),
   count_step(filter(model_input, pass_complete), "All model inputs available"),
@@ -530,7 +582,8 @@ Write the application outputs:
 - the per-location-day remote sensing estimates;
 - the in situ location-days for comparison;
 - location coordinates;
-- per-row pass/fail flags for every check.
+- per-row pass/fail flags for every check, with the DI and the names of any
+  inputs outside their training range.
 
 The applicability checks themselves are written alongside the model, to
 `xg_models/v3_production/applicability/`, so anyone applying the model can
@@ -542,7 +595,9 @@ screen their own observations without the training data:
   training missions; and the training minimum SDD;
 - `aoa_reference.csv`: the training reference already transformed into AOA
   space (standardized and weighted), one row per CV-pool matchup, which is
-  what a new observation's nearest-neighbor distance is measured against.
+  what a new observation's nearest-neighbor distance is measured against;
+- `training_region.geojson`: the training region footprint for the region
+  check.
 
 ```{r export}
 locations <- station_sites %>%
@@ -553,7 +608,8 @@ write_parquet(rs_estimates, file.path(OUT_DIR, "application_rs_estimates.parquet
 write_parquet(insitu_location_days, file.path(OUT_DIR, "application_insitu_location_days.parquet"))
 write_parquet(locations, file.path(OUT_DIR, "application_locations.parquet"))
 write_parquet(model_input %>%
-                select(location_id, date, mission, pass_mission, pass_season, pass_complete, pass_range, pass_aoa, pass_plausible, di),
+                select(location_id, date, mission, pass_region, pass_mission, pass_season, pass_complete, pass_range,
+                       out_of_range, pass_aoa, pass_plausible, di),
               file.path(OUT_DIR, "application_row_flags.parquet"))
 log("wrote application outputs to %s", OUT_DIR)
 
@@ -570,6 +626,10 @@ write_json(list(aoa_threshold = aoa_threshold,
            file.path(APPLICABILITY_DIR, "aoa_parameters.json"),
            auto_unbox = TRUE, digits = I(17), pretty = TRUE)
 write_csv(as_tibble(train_X), file.path(APPLICABILITY_DIR, "aoa_reference.csv"))
+training_region_path <- file.path(APPLICABILITY_DIR, "training_region.geojson")
+if (file.exists(training_region_path)) file.remove(training_region_path)
+st_write(st_sf(geometry = training_region), training_region_path, quiet = TRUE,
+         layer_options = "COORDINATE_PRECISION=6")
 log("wrote applicability checks to %s", APPLICABILITY_DIR)
 ```
 
@@ -622,7 +682,9 @@ superseded$pred <- map(ENSEMBLE_SEEDS, \(s) {
 
 superseded <- superseded %>%
   left_join(training %>% distinct(siteSR_id, is_holdout), by = "siteSR_id") %>%
-  mutate(pass_mission = mission %in% TRAINING_MISSIONS,
+  left_join(sites_meta %>% distinct(siteSR_id, WGS84_Latitude, WGS84_Longitude), by = "siteSR_id") %>%
+  mutate(pass_region = in_region(.),
+         pass_mission = pass_region & mission %in% TRAINING_MISSIONS,
          pass_season = pass_mission & in_season(.),
          pass_complete = pass_season & feature_complete(.),
          pass_range = pass_complete & in_range(.),
@@ -644,7 +706,7 @@ superseded_metrics <- function(df) {
 
 superseded_validation <- bind_rows(
   superseded %>%
-    mutate(group = case_when(!pass_range ~ "outside season or training range",
+    mutate(group = case_when(!pass_range ~ "outside region, season, or training range",
                              !pass_aoa ~ "outside AOA",
                              !pass_plausible ~ "below plausibility floor",
                              TRUE ~ "passes all checks")),
@@ -684,7 +746,7 @@ axis_max <- ceiling(max(superseded_passing$obs, superseded_passing$pred))
 
 ggplot(superseded_passing, aes(obs, pred)) +
   geom_abline(linetype = "dashed", colour = "grey50") +
-  geom_point(alpha = 0.3, size = 1) +
+  geom_point(alpha = 0.3, size = 1.25) +
   geom_text(data = panel_labels, aes(x = 0, y = axis_max, label = label),
             hjust = 0, vjust = 1, size = 3.2, lineheight = 0.9) +
   coord_equal(xlim = c(0, axis_max), ylim = c(0, axis_max)) +

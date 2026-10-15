@@ -1,0 +1,33 @@
+{
+  "model": "xgboost",
+  "features": [
+    "atm_corr_LaSRC",
+    "green_corr7",
+    "nir_corr7",
+    "swir1_corr7",
+    "temp_corr7",
+    "BR",
+    "BG",
+    "NR",
+    "fai",
+    "NDVI",
+    "NDSSI",
+    "NDWI",
+    "MNDWI"
+  ],
+  "best_params": {
+    "eta": 0.01,
+    "max_depth": 2,
+    "min_child_weight": 10,
+    "subsample": 0.6,
+    "colsample_bytree": 0.4,
+    "reg_alpha": 0,
+    "reg_lambda": 20
+  },
+  "best_score": 1.5329242903522817,
+  "best_gap": 0.10381868759243318,
+  "best_train_rmse": 1.4291056027598485,
+  "pure_best_val_rmse": 1.5276123441742864,
+  "band_size": 40,
+  "n_trials": 40
+}

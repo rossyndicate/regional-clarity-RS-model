@@ -12,7 +12,7 @@ toc: false
 
 This site presents the workflow behind the regional Secchi disc depth (SDD) model, which is built from in situ SDD matched to Landsat Collection 2 surface reflectance. Both come from the AquaMatch data products on the Environmental Data Initiative (EDI) repository (see [Data sources](#data-sources)). Each page is one step of the workflow, shown with its code and outputs. Every page opens with a header giving its purpose, inputs, outputs, and the previous and next steps.
 
-The [model card](model_card.qmd) summarizes the production model: intended use, training data, performance, applicability checks, and limitations.
+Two models are published, each with its own model card covering intended use, training data, performance, applicability checks, and limitations. The [production model](model_card.qmd) uses Landsat reflectance together with catchment characteristics and antecedent weather. The [band-only model](model_card_band_only.qmd) uses Landsat-derived features alone and needs no other data at inference. The two were built from the same data with the same procedure, and each card compares them.
 
 Data preparation and application run in R. Modeling runs in Python notebooks that share the modules in `regional_clarity/python/`. Step 07 sources the R functions in `regional_clarity/R/`. Arrows are labeled with the main file each step hands to the next.
 
@@ -33,18 +33,30 @@ Data preparation and application run in R. Modeling runs in Python notebooks tha
 | 06 | [Test-set sensitivity](regional_clarity/06_test_set_sensitivity.ipynb) | Holdout RMSE across 16 holdout draws. |
 | 07 | [Regional application](regional_clarity/07_regional_application.Rmd) | Apply the ensemble at in situ SDD locations, with training-domain and AOA checks. |
 
+### Band-only baseline
+
+Steps 04b–07b repeat steps 04–07 with the candidate features restricted to the Landsat scene itself: the harmonized bands, spectral indices, and the LaSRC flag. Everything else is identical, including the data, holdout, CV folds, tuning, and selection, so the comparison sections at the end of each page measure what the site characteristics and antecedent weather add to the production model.
+
+| Step | Page | What it does |
+|---|---|---|
+| 04b | [Make models (band-only)](regional_clarity/04b_make_models_band_only.ipynb) | Band-only ensemble with the same per-seed pipeline as 04. |
+| 05b | [Evaluate ensemble (band-only)](regional_clarity/05b_evaluate_ensemble_band_only.ipynb) | Holdout performance and SHAP, compared with production. |
+| 06b | [Test-set sensitivity (band-only)](regional_clarity/06b_test_set_sensitivity_band_only.ipynb) | The 16-draw holdout sweep, paired draw by draw with production's. |
+| 07b | [Regional application (band-only)](regional_clarity/07b_regional_application_band_only.Rmd) | The regional application and applicability checks, compared with production. |
+
 Source code: [rossyndicate/regional-clarity-RS-model](https://github.com/rossyndicate/regional-clarity-RS-model).
 
 ## Applying the model to your own data
 
-The production model folder holds only the fitted ensemble and the files the applicability checks need. It is tracked in the repository under `regional_clarity/xg_models/v3_production/` and published on the [Hugging Face Hub](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat). The code for applying the model lives in the source repository:
+Each model folder holds only the fitted ensemble and the files the applicability checks need. The production model is tracked in the repository under `regional_clarity/xg_models/v3_production/` and published on the Hugging Face Hub as [`bgsteele/intermountain-west-regional-clarity-sdd-landsat`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat). The band-only model is under `regional_clarity/xg_models/v3_band_only/` and published as [`bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only). The code for applying either model lives in the source repository:
 
 | File | Language | What it does |
 |---|---|---|
-| [`regional_clarity/R/prepare_model_inputs.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/prepare_model_inputs.R) | R | Build model inputs from AquaMatch siteSR sites and QA'd observations: elevation, LakeCat catchment metrics, gridMET antecedent weather, spectral indices, and site-feature coarsening. [Step 07](regional_clarity/07_regional_application.Rmd) uses the same functions. |
-| [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) | Python | Load the 40-booster ensemble, predict SDD, and run the applicability checks against the model folder's `applicability/` files. |
+| [`regional_clarity/R/siteSR_qa.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/siteSR_qa.R) | R | Apply the training data's observation QA to siteSR sites and observations: site geometry, pixel, temperature, and scene QA, and the per-site band-outlier filter. [Step 01](regional_clarity/01_filter_AquaMatch_Data.Rmd) uses the same functions. |
+| [`regional_clarity/R/prepare_model_inputs.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/prepare_model_inputs.R) | R | Build model inputs from AquaMatch siteSR sites and QA'd observations: elevation, LakeCat catchment metrics, gridMET antecedent weather, spectral indices, and site-feature coarsening. `site_and_weather = FALSE` builds the band-only model's inputs without the web fetches. Steps [07](regional_clarity/07_regional_application.Rmd) and [07b](regional_clarity/07b_regional_application_band_only.Rmd) use the same functions. |
+| [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) | Python | Load either 40-booster ensemble, predict SDD, and flag observations outside the training domain with the applicability checks, using that model folder's `applicability/` files. |
 
-The [model card](model_card.qmd#how-to-use) has a worked example.
+[Applying the model](applying_the_model.qmd) walks through accessing either model and using these helpers step by step.
 
 ## How to cite
 

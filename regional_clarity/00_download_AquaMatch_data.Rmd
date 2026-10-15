@@ -78,20 +78,19 @@ extracted at each AquaMatch site. These arrive as separate files per Landsat
 mission. The algal mask is not applied here.
 
 ```{r download-siteSR, eval=FALSE}
-download_siteSR(save_location = aquamatch_dir, 
+download_siteSR(download_folder = aquamatch_dir, 
                 version = "newest", 
                 algal_mask = FALSE)
 ```
 
 Stack the per-mission siteSR files into a single dataset so that all Landsat
-missions share one table, saved as a feather file.
+missions share one table, saved as a parquet file.
 
 ```{r siteSR-stack, eval=FALSE}
 build_sr(which_sr = "siteSR",
          sr_location = aquamatch_dir,
          algal_mask = FALSE,
-         save = TRUE, 
-         save_location = file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.feather")
+         output_file = file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.parquet")
 )
 
 ```
@@ -99,27 +98,18 @@ build_sr(which_sr = "siteSR",
 Atmospheric correction and differing sensor specifications across Landsat missions
 can create artificial patterns in the surface reflectance product, so each
 mission is harmonized to a common reference before modeling. This chunk
-converts the stacked feather file to parquet, then applies the Gardner-style
-polynomial handoff coefficients that AquaMatch provides, using Landsat 7 as
-the reference sensor. The result, `siteSR_DSWE1_LS7corr.parquet`, is the
+applies the Gardner-style polynomial handoff coefficients that AquaMatch
+provides, using Landsat 7 as the reference sensor. The result, `siteSR_DSWE1_LS7corr.parquet`, is the
 reflectance input to the rest of the pipeline.
 
 ```{r apply-handsoff, eval=FALSE}
-# workaround for feather/parquet issue
-open_dataset(file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.feather"), 
-             format = "feather") %>% 
-  write_dataset(dataset = .,  
-                path = file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.parquet"),
-                format = "parquet")
-
-# and apply handoffs
 apply_handoffs(
   input_path = file.path(aquamatch_dir, "siteSR_DSWE1_full_concatenation.parquet"),
   handoff_path = list.files(aquamatch_dir, full.names = T)[grepl("handoff", list.files(aquamatch_dir))],
   correction_method = "Gardner_poly",
   sat_target = "LS7",
-  algal_mask = "FALSE",
-  save_location = "aquamatch_files/downloads/siteSR_DSWE1_LS7corr.parquet"
+  algal_mask = FALSE,
+  output_file = file.path(aquamatch_dir, "siteSR_DSWE1_LS7corr.parquet")
 )
 ```
 
@@ -128,6 +118,6 @@ cloud cover, sun angle, and acquisition time). [01](01_filter_AquaMatch_Data.Rmd
 uses these fields to filter the reflectance data.
 
 ```{r sitesr-scene, eval=FALSE}
-download_sceneMetadata(save_location = aquamatch_dir, product = "siteSR")
+download_sceneMetadata(download_folder = aquamatch_dir, product = "siteSR")
 ```
 

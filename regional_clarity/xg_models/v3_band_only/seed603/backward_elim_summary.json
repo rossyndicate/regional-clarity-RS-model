@@ -1,0 +1,89 @@
+{
+  "starting_candidates": [
+    "atm_corr_LaSRC",
+    "red_corr7",
+    "green_corr7",
+    "blue_corr7",
+    "nir_corr7",
+    "swir1_corr7",
+    "swir2_corr7",
+    "temp_corr7",
+    "BR",
+    "BG",
+    "NR",
+    "GR",
+    "fai",
+    "NDVI",
+    "NDSSI",
+    "NDWI",
+    "MNDWI"
+  ],
+  "correlation_pruned": [
+    "atm_corr_LaSRC",
+    "green_corr7",
+    "nir_corr7",
+    "swir1_corr7",
+    "temp_corr7",
+    "BR",
+    "BG",
+    "NR",
+    "fai",
+    "NDVI",
+    "NDSSI",
+    "NDWI",
+    "MNDWI"
+  ],
+  "final_features": [
+    "atm_corr_LaSRC",
+    "green_corr7",
+    "nir_corr7",
+    "swir1_corr7",
+    "temp_corr7",
+    "BR",
+    "BG",
+    "NR",
+    "fai",
+    "NDVI",
+    "NDSSI",
+    "NDWI",
+    "MNDWI"
+  ],
+  "path": [
+    {
+      "step": 0,
+      "n_features": 13,
+      "mean_cv_rmse": 1.5384793187501833,
+      "shadow_floor": 0.00030462321867878267,
+      "features": [
+        "atm_corr_LaSRC",
+        "green_corr7",
+        "nir_corr7",
+        "swir1_corr7",
+        "temp_corr7",
+        "BR",
+        "BG",
+        "NR",
+        "fai",
+        "NDVI",
+        "NDSSI",
+        "NDWI",
+        "MNDWI"
+      ],
+      "real_importance": {
+        "atm_corr_LaSRC": 0.009807312052275067,
+        "green_corr7": 0.24018593816414704,
+        "nir_corr7": 0.01254273084921483,
+        "swir1_corr7": 0.005841440240041296,
+        "temp_corr7": 0.005967362069742817,
+        "BR": 0.09331707162156898,
+        "BG": 0.22659878032829392,
+        "NR": 0.011410294906429827,
+        "fai": 0.05275407161174076,
+        "NDVI": 0.004678522310851252,
+        "NDSSI": 0.013898004743412073,
+        "NDWI": 0.0013661360751460923,
+        "MNDWI": 0.06741858598834781
+      }
+    }
+  ]
+}

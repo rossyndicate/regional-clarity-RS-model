@@ -1,11 +1,13 @@
 # Full pinned dependency tree of the .venv used for the production run (Python 3.11.16).
 # Regenerate with: .venv/bin/python -m pip freeze > requirements-lock.txt
+anyio==4.15.1
 appnope==1.0.0
 asttokens==3.0.2
 attrs==26.1.0
 beautifulsoup4==4.15.0
 bleach==4.1.0
 certifi==2026.7.22
+click==8.5.0
 cloudpickle==3.1.2
 comm==0.2.3
 contourpy==1.3.3
@@ -14,8 +16,16 @@ debugpy==1.8.21
 defusedxml==0.7.1
 executing==2.2.1
 fastjsonschema==2.22.2
+filelock==4.0.12
 fonttools==4.65.0
+fsspec==2026.9.0
 geopandas==1.1.4
+h11==0.16.0
+hf-xet==1.7.0
+httpcore2==2.13.1
+httpx2==2.13.1
+huggingface_hub==2.1.1
+idna==3.20
 ipykernel==7.3.0
 ipython==9.17.1
 ipython_pygments_lexers==1.1.1
@@ -58,6 +68,7 @@ pyogrio==0.13.0
 pyparsing==3.3.2
 pyproj==3.7.2
 python-dateutil==2.9.0.post0
+PyYAML==6.0.3
 pyzmq==27.2.0
 referencing==0.37.0
 rpds-py==2026.6.3
@@ -74,6 +85,7 @@ tinycss2==1.5.1
 tornado==6.5.8
 tqdm==4.70.1
 traitlets==5.16.1
+truststore==0.10.4
 typing_extensions==4.16.0
 wcwidth==0.8.3
 webencodings==0.5.1

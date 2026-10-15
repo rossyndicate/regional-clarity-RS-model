@@ -1,0 +1,822 @@
+---
+title: "Regional Application at In Situ SDD Locations: Band-Only Baseline"
+author: "B Steele, Colorado State University, ROSSyndicate"
+date: "last updated Oct 8, 2026"
+output: html_document
+---
+
+**Pipeline step 07b · R · run from the repository root**
+
+- **Purpose:** Apply the band-only ensemble exactly as `07_regional_application.Rmd` applies production: the same observations, applicability checks, and superseded-matchup validation, then compare the two.
+- **Inputs:** `aquamatch_files/`: `sdd_quality_filter.parquet`, `siteSR_DSWE1_regional_band_filtered.parquet`, `base_with_splits.parquet`, `regional_sdd_not_closest.parquet`; the cached fetches and outputs of step 07 in `aquamatch_files/application/`; `xg_models/v3_band_only/` (fold models, `ensemble_mean_abs_shap.csv`).
+- **Outputs:** `aquamatch_files/application_band_only/`: `application_rs_estimates.parquet`, `application_filter_steps.csv`, `superseded_validation.csv`, `application_predictions.parquet`; `xg_models/v3_band_only/applicability/`: `aoa_parameters.json`, `aoa_reference.csv`, `training_region.geojson`.
+- **Previous:** [06b · Test-set sensitivity (band-only)](06b_test_set_sensitivity_band_only.ipynb)
+
+This script repeats `07_regional_application.Rmd` with the band-only ensemble
+(`04b_make_models_band_only.ipynb`), whose inputs are limited to the
+harmonized Landsat bands, spectral indices, and the LaSRC flag. Everything else
+is unchanged: the same in situ locations, the same QA'd siteSR observations,
+and the same eight checks, in the same order:
+
+1. the scene passes the siteSR QA used to build the training data;
+2. the site falls inside the training region;
+3. it comes from a Landsat mission represented in training;
+4. it falls within the seasonal window of the training matchups;
+5. every model input is available;
+6. every input falls within the training range;
+7. the observation falls inside the model's area of applicability (AOA); and
+8. the estimate is no shallower than the shallowest training SDD.
+
+Checks 5–7 are defined by each model's own inputs, so they differ between
+the two models. The band-only model needs no site characteristics or weather,
+so check 5 cannot fail for missing LakeCat or gridMET data. Its AOA is
+computed over its own unanimous core and SHAP weights, from
+`05b_evaluate_ensemble_band_only.ipynb`.
+
+Site characteristics and gridMET weather are still joined to the model input,
+reusing step 07's cached fetches, so the table matches 07's and the superseded
+matchups are built identically. The band-only models never read those
+columns. Run step 07 first. Predictions and outputs are written to
+`aquamatch_files/application_band_only/`, and the applicability files to
+`xg_models/v3_band_only/applicability/`, so production's are untouched.
+
+The final section compares the filter cascade, the superseded-matchup
+performance, and the estimates themselves with step 07.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+Load packages and define the run constants: input paths, the band-only
+model directory and its 10 ensemble seeds (601–610), the output and cache
+directory, and the cache-refresh switch. The model-input functions (site
+characteristics, gridMET weather, feature engineering) come from
+`R/prepare_model_inputs.R`, which end users call to prepare their own data, so
+the application below runs the same code.
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(arrow)
+library(tidyverse)
+library(sf)
+library(igraph)
+library(xgboost)
+library(jsonlite)
+library(RANN)
+
+# model-input assembly shared with end users (site characteristics, gridMET
+# weather, feature engineering); see the file header
+source("regional_clarity/R/prepare_model_inputs.R")
+
+log <- function(...) cat(sprintf("[%s] ", format(Sys.time(), "%H:%M:%S")), sprintf(...), "\n")
+
+AQUAMATCH_DIR <- "regional_clarity/aquamatch_files"
+SITES_META_PATH <- file.path(AQUAMATCH_DIR, "downloads", "siteSR_collated_WQP_NWIS_sites_with_NHD_info_2025-06-04.csv")
+SITESR_RAW_PATH <- file.path(AQUAMATCH_DIR, "downloads", "siteSR_DSWE1_LS7corr.parquet")
+SITESR_QA_PATH <- file.path(AQUAMATCH_DIR, "siteSR_DSWE1_regional_band_filtered.parquet")
+SDD_QC_PATH <- file.path(AQUAMATCH_DIR, "sdd_quality_filter.parquet")
+TRAINING_PATH <- file.path(AQUAMATCH_DIR, "base_with_splits.parquet")
+MODEL_DIR <- file.path("regional_clarity", "xg_models", "v3_band_only")
+ENSEMBLE_SEEDS <- 601:610
+
+# step 07's output directory: its cached site-characteristic and gridMET
+# fetches are reused here, and its outputs are read for the comparison
+PRODUCTION_OUT_DIR <- file.path(AQUAMATCH_DIR, "application")
+OUT_DIR <- file.path(AQUAMATCH_DIR, "application_band_only")
+dir.create(OUT_DIR, showWarnings = FALSE)
+FORCE_REFRESH_CACHE <- FALSE
+N_WORKERS <- 8
+```
+
+## In situ SDD stations
+
+The in situ baseline is the quality-controlled regional SDD record that feeds
+matchup creation (`01_filter_AquaMatch_Data.Rmd`, the "RANSAC inliers" step):
+tier/flag QC, the regional HUC4 restriction, and removal of per-site RANSAC
+outliers. Sites with too few observations to run RANSAC (`is_inlier` missing)
+are kept, as they are in `01`.
+
+```{r insitu}
+sdd <- read_parquet(SDD_QC_PATH,
+                    col_select = c("MonitoringLocationIdentifier", "ActivityStartDate",
+                                   "harmonized_value", "is_inlier")) %>%
+  filter(is.na(is_inlier) | is_inlier) %>%
+  mutate(date = as.Date(ActivityStartDate))
+
+log("in situ SDD: %s rows, %s stations, %s station-days", nrow(sdd),
+    n_distinct(sdd$MonitoringLocationIdentifier),
+    nrow(distinct(sdd, MonitoringLocationIdentifier, date)))
+```
+
+## Link stations to siteSR sites and physical locations
+
+AquaMatch's site table carries both the WQP-style
+`MonitoringLocationIdentifier` (as `loc_id`) and, for NWIS-sourced sites, the
+bare USGS station number (the WQP identifier is `USGS-` + that number). A
+station can map to more than one `siteSR_id` (e.g. `WQP_*` and `NWIS_*`
+entries for the same USGS station).
+
+```{r link-sites}
+sites_meta <- read_csv(SITES_META_PATH, show_col_types = FALSE,
+                       col_select = c(siteSR_id, loc_id, source, WGS84_Latitude, WGS84_Longitude,
+                                      wb_nhd_id, wb_nhd_source, flag_wb, flag_optical_shoreline)) %>%
+  mutate(MonitoringLocationIdentifier = if_else(source == "NWIS", paste0("USGS-", loc_id), loc_id))
+
+station_sites <- sites_meta %>%
+  filter(MonitoringLocationIdentifier %in% sdd$MonitoringLocationIdentifier) %>%
+  distinct(siteSR_id, .keep_all = TRUE)
+
+stopifnot("some in situ stations have no AquaMatch site record" =
+            all(unique(sdd$MonitoringLocationIdentifier) %in% station_sites$MonitoringLocationIdentifier))
+log("%s stations -> %s siteSR_ids", n_distinct(station_sites$MonitoringLocationIdentifier),
+    nrow(station_sites))
+```
+
+Group those `siteSR_id`s into physical locations with the same rule as
+`01_filter_AquaMatch_Data.Rmd`: within 100 m and on the same NHD waterbody,
+with grouping transitive through connected components. A site with no matched
+waterbody is only grouped with itself.
+
+```{r locations}
+site_pts <- st_as_sf(station_sites, coords = c("WGS84_Longitude", "WGS84_Latitude"),
+                     crs = 4326, remove = FALSE)
+within_100m <- st_is_within_distance(site_pts, dist = 100)
+wb <- station_sites$wb_nhd_id
+within_100m_same_wb <- Map(function(nbrs, i) {
+  keep <- nbrs == i | (!is.na(wb[nbrs]) & !is.na(wb[i]) & wb[nbrs] == wb[i])
+  nbrs[keep]
+}, within_100m, seq_along(within_100m))
+
+station_sites <- station_sites %>%
+  mutate(location_id = components(graph_from_adj_list(within_100m_same_wb, mode = "all"))$membership)
+
+# one location per station: a station whose siteSR_ids land in different
+# locations (rare; different coordinates across sources) is assigned to the
+# location holding most of its siteSR_ids
+station_location <- station_sites %>%
+  count(MonitoringLocationIdentifier, location_id) %>%
+  slice_max(n, n = 1, with_ties = FALSE, by = MonitoringLocationIdentifier) %>%
+  select(MonitoringLocationIdentifier, location_id)
+
+insitu_location_days <- sdd %>%
+  inner_join(station_location, by = "MonitoringLocationIdentifier") %>%
+  distinct(location_id, date)
+
+log("%s stations -> %s physical locations; %s in situ location-days",
+    nrow(station_location), n_distinct(station_location$location_id), nrow(insitu_location_days))
+```
+
+## siteSR observations at in situ locations
+
+Step 0 is every siteSR observation at these locations before any QA, counted
+from the national concatenated siteSR file. Step 1 is the QA'd regional
+siteSR file written by `01_filter_AquaMatch_Data.Rmd` (geometry and HUC4
+scoping, scene metadata QA, and band RANSAC). Because `01` scopes by HUC4 and
+site geometry, a location can drop out entirely at step 1; those locations
+are not observable in this framework.
+
+```{r sitesr-rows}
+location_lookup <- station_sites %>% select(siteSR_id, location_id)
+
+raw_counts_cache <- file.path(PRODUCTION_OUT_DIR, "sitesr_raw_location_days.parquet")
+if (!FORCE_REFRESH_CACHE && file.exists(raw_counts_cache)) {
+  sitesr_raw_location_days <- read_parquet(raw_counts_cache)
+} else {
+  sitesr_raw_location_days <- open_dataset(SITESR_RAW_PATH) %>%
+    select(siteSR_id, date) %>%
+    filter(siteSR_id %in% location_lookup$siteSR_id) %>%
+    collect() %>%
+    mutate(date = as.Date(date)) %>%
+    inner_join(location_lookup, by = "siteSR_id") %>%
+    distinct(location_id, date)
+  write_parquet(sitesr_raw_location_days, raw_counts_cache)
+}
+
+sitesr_qa <- read_parquet(SITESR_QA_PATH) %>%
+  filter(siteSR_id %in% location_lookup$siteSR_id) %>%
+  mutate(date = as.Date(date)) %>%
+  inner_join(location_lookup, by = "siteSR_id")
+
+log("pre-QA: %s location-days at %s locations", nrow(sitesr_raw_location_days),
+    n_distinct(sitesr_raw_location_days$location_id))
+log("post-QA: %s rows, %s location-days at %s locations", nrow(sitesr_qa),
+    nrow(distinct(sitesr_qa, location_id, date)), n_distinct(sitesr_qa$location_id))
+```
+
+## Site characteristics
+
+Elevation and LakeCat catchment metrics per `siteSR_id`, following
+`02b_pull_site_characteristics.Rmd`. Sites already in that script's output
+(`site_characteristics.feather`, the training sites) are reused, and only the
+remaining sites are fetched. `shore_flag` uses the definition from
+`03_split_data.ipynb`.
+
+```{r site-characteristics}
+site_char_cache <- file.path(PRODUCTION_OUT_DIR, "application_site_characteristics.feather")
+qa_sites <- station_sites %>% filter(siteSR_id %in% unique(sitesr_qa$siteSR_id))
+
+if (!FORCE_REFRESH_CACHE && file.exists(site_char_cache)) {
+  site_char <- read_feather(site_char_cache)
+} else {
+  site_char <- fetch_site_characteristics(
+    qa_sites, existing = read_feather(file.path(AQUAMATCH_DIR, "site_characteristics.feather")))
+  write_feather(site_char, site_char_cache)
+}
+
+log("sites with LakeCat data: %s / %s", sum(!is.na(site_char$pct_impervious_2006)), nrow(site_char))
+```
+
+## Antecedent weather (gridMET)
+
+gridMET is a 1/24° grid, and many sites share a cell. Weather is therefore
+fetched once per cell (at the cell center) over the full date range needed by
+that cell's siteSR observations, then assigned back to every site in the cell.
+Rolling summaries follow `02c_pull_weather_summaries.Rmd` and cover the *w* days
+strictly before the image date.
+
+```{r gridmet-cells}
+site_cells <- gridmet_cells(qa_sites)
+cell_ranges <- gridmet_cell_ranges(sitesr_qa, site_cells)
+
+log("%s sites fall in %s gridMET cells", nrow(site_cells), nrow(cell_ranges))
+```
+
+Fetch daily gridMET weather at each cell center in parallel (PSOCK workers,
+see `02c_pull_weather_summaries.Rmd`). A failed cell is retried once, and cells
+that still fail are written to `gridmet_fetch_failures.csv`. The raw daily
+series are cached.
+
+```{r gridmet-fetch}
+weather_raw_cache <- file.path(PRODUCTION_OUT_DIR, "application_weather_raw.feather")
+
+if (!FORCE_REFRESH_CACHE && file.exists(weather_raw_cache)) {
+  weather_raw <- read_feather(weather_raw_cache)
+} else {
+  fetched <- fetch_gridmet(cell_ranges, n_workers = N_WORKERS)
+  if (nrow(fetched$failed) > 0) write_csv(fetched$failed, file.path(PRODUCTION_OUT_DIR, "gridmet_fetch_failures.csv"))
+  weather_raw <- fetched$weather
+  write_feather(weather_raw, weather_raw_cache)
+}
+```
+
+Convert units and pad each cell's series to one row per calendar day. Then
+compute the 1-, 3-, 7-, and 30-day rolling summaries: total precipitation,
+maximum daily high, mean temperature, minimum daily low, and mean solar
+radiation. Dates are shifted by one day so that each window ends the day
+before the image date.
+
+```{r gridmet-summarize}
+weather_summary_cache <- file.path(PRODUCTION_OUT_DIR, "application_weather_summaries.feather")
+
+if (!FORCE_REFRESH_CACHE && file.exists(weather_summary_cache)) {
+  weather_summaries <- read_feather(weather_summary_cache)
+} else {
+  weather_summaries <- summarize_weather(weather_raw)
+  write_feather(as.data.frame(weather_summaries), weather_summary_cache)
+}
+log("weather summaries: %s cell-days", nrow(weather_summaries))
+```
+
+## Assemble model inputs
+
+The band columns in the QA'd siteSR file are already harmonized to Landsat 7
+(Gardner et al.; `*_corr_7`). Spectral indices and the coarsening of site
+features are R ports of `python/features.py` (`add_spectral_indices()` and
+`coarsen_site_features()`). The same function is applied to the training data
+below, so the applicability checks compare like with like. Both are defined
+in `R/prepare_model_inputs.R` (`add_features()`).
+
+Build one model-input row per QA'd siteSR observation. Each row combines
+the harmonized bands, a flag for Landsat 8/9 atmospheric correction
+(LaSRC), site characteristics, and the antecedent weather for that site's
+gridMET cell on the image date. Spectral indices and coarsened site
+features are then added.
+
+```{r assemble}
+model_input <- assemble_model_inputs(sitesr_qa, site_char, site_cells, weather_summaries,
+                                     keep = "location_id") %>%
+  left_join(sites_meta %>% distinct(siteSR_id, WGS84_Latitude, WGS84_Longitude), by = "siteSR_id")
+
+log("model input: %s rows", nrow(model_input))
+```
+
+## Predict with the 10-seed band-only ensemble
+
+Each seed's saved feature set and four fold models are used as trained. The
+prediction for a row is the mean over all 40 models, and the spread across
+the 10 seed means is kept as a measure of ensemble disagreement.
+
+First, read the feature list each seed selected during tuning. Seeds can
+differ slightly in their final features.
+
+```{r model-features}
+seed_feats <- map(ENSEMBLE_SEEDS, \(s) {
+  fromJSON(file.path(MODEL_DIR, paste0("seed", s), "final_tune_xgboost.json"))$features
+}) %>%
+  set_names(ENSEMBLE_SEEDS)
+model_feats <- sort(unique(unlist(seed_feats)))
+```
+
+For each seed, predict with its four fold models on that seed's features and
+average them to give the seed's prediction. Across seeds, record the mean
+(`pred_sdd`) and the standard deviation (`pred_seed_sd`). Predictions are
+cached.
+
+```{r predict}
+pred_cache <- file.path(OUT_DIR, "application_predictions.parquet")
+
+if (!FORCE_REFRESH_CACHE && file.exists(pred_cache)) {
+  preds <- read_parquet(pred_cache)
+} else {
+  seed_preds <- map(ENSEMBLE_SEEDS, \(s) {
+    feats <- seed_feats[[as.character(s)]]
+    X <- as.matrix(model_input[, feats])
+    fold_preds <- map(1:4, \(fold) {
+      booster <- xgb.load(file.path(MODEL_DIR, paste0("seed", s), paste0("xgboost_fold", fold, ".json")))
+      predict(booster, X)
+    })
+    log("seed%s predicted", s)
+    rowMeans(do.call(cbind, fold_preds))
+  })
+  seed_mat <- do.call(cbind, seed_preds)
+  preds <- tibble(pred_sdd = rowMeans(seed_mat), pred_seed_sd = apply(seed_mat, 1, sd))
+  write_parquet(preds, pred_cache)
+}
+stopifnot(nrow(preds) == nrow(model_input))
+model_input <- bind_cols(model_input, preds)
+```
+
+## Applicability checks
+
+### Training reference
+
+The reference is the cross-validation pool that trained the ensemble (every
+non-holdout row of `base_with_splits.parquet`), with features engineered by
+the same function as above.
+
+```{r training-reference}
+training <- read_parquet(TRAINING_PATH) %>%
+  mutate(date = as.Date(date)) %>%
+  add_features()
+train_pool <- training %>% filter(!is_holdout)
+log("training reference: %s CV-pool rows", nrow(train_pool))
+```
+
+### Training region
+
+The training data were scoped to the HUC4 basins that overlap the six-state
+region by at least half (`01_filter_AquaMatch_Data.Rmd`, "Regional AOI"). An
+observation passes when its site falls inside that footprint. The footprint is
+dissolved and simplified to 30 m (one Landsat pixel) so that it can ship with
+the model; points on its boundary count as inside, as in 01's spatial join.
+None of the other checks measures geographic distance, so a site in another
+region with familiar-looking conditions would otherwise pass. Every
+observation here was already scoped by 01, so this check removes nothing in
+this application; it exists for new data.
+
+```{r region-check}
+training_region <- st_read(file.path(AQUAMATCH_DIR, "huc4_filtered.gdb"), layer = "huc4_filtered", quiet = TRUE) %>%
+  st_make_valid() %>%
+  st_transform(5070) %>%
+  st_union() %>%
+  st_simplify(preserveTopology = TRUE, dTolerance = 30) %>%
+  st_transform(4326)
+
+in_region <- function(df) {
+  pts <- st_as_sf(df %>% select(WGS84_Longitude, WGS84_Latitude), coords = c("WGS84_Longitude", "WGS84_Latitude"),
+                  crs = 4326, na.fail = FALSE)
+  lengths(st_intersects(pts, training_region)) > 0
+}
+```
+
+### Feature range ("training box")
+
+An observation passes when every model input used by any seed lies within the
+minimum and maximum of that feature in the training pool. Tree ensembles do
+not extrapolate: outside the training range, a prediction flattens at the
+value of the outermost leaf, so these estimates carry no information about
+how SDD responds beyond the sampled conditions.
+
+```{r range-check}
+feature_ranges <- train_pool %>%
+  summarise(across(all_of(model_feats), list(min = ~ min(.x, na.rm = TRUE), max = ~ max(.x, na.rm = TRUE)))) %>%
+  pivot_longer(everything(), names_to = c("feature", ".value"), names_pattern = "(.*)_(min|max)$")
+
+in_range <- function(df) {
+  ok <- rep(TRUE, nrow(df))
+  for (i in seq_len(nrow(feature_ranges))) {
+    x <- df[[feature_ranges$feature[i]]]
+    ok <- ok & !is.na(x) & x >= feature_ranges$min[i] & x <= feature_ranges$max[i]
+  }
+  ok
+}
+
+# the inputs outside their training range, comma-separated ("" when none)
+out_of_range <- function(df) {
+  names_out <- rep("", nrow(df))
+  for (i in seq_len(nrow(feature_ranges))) {
+    x <- df[[feature_ranges$feature[i]]]
+    outside <- !is.na(x) & (x < feature_ranges$min[i] | x > feature_ranges$max[i])
+    names_out <- paste0(names_out, if_else(outside, paste0(feature_ranges$feature[i], ","), ""))
+  }
+  sub(",$", "", names_out)
+}
+
+feature_complete <- function(df) complete.cases(df[, model_feats])
+```
+
+### Seasonal window
+
+The training matchups are concentrated in the open-water season (about 85% in
+May–October; under 4% in November–March). The area of applicability below
+weights features by their SHAP contribution, and air and surface temperature
+carry little weight, so it barely distinguishes a January scene from a July
+scene with similar optics. Ice-season conditions (partial ice cover, winter
+mixing, snowmelt) are nonetheless outside what the model has learned. An
+observation therefore has to fall within the day-of-year window spanning the
+central 98% of the training matchups (1st to 99th percentile).
+
+```{r season-window}
+training_doy <- yday(train_pool$date)
+season_window <- round(quantile(training_doy, c(0.01, 0.99)))
+in_season <- function(df) between(yday(df$date), season_window[1], season_window[2])
+log("seasonal window: day of year %s-%s", season_window[1], season_window[2])
+```
+
+### Area of applicability
+
+The dissimilarity index (DI) of Meyer & Pebesma (2021) is computed over the
+features every seed kept (the same core used for SHAP attribution in
+`05b_evaluate_ensemble_band_only.ipynb`). Features are standardized by the training
+pool's mean and standard deviation, then weighted by their ensemble mean
+|SHAP|, so distance is measured in the directions the model relies on. An
+observation's DI is the distance to its nearest training observation, divided
+by the mean pairwise distance within the training pool.
+
+The threshold follows Meyer & Pebesma (2021): the DI of each training
+observation to its nearest neighbor *in a different cross-validation fold*
+(the four HUC8-grouped CV-pool partitions, `holdout_part` 1-4), with the
+threshold set at the upper whisker of that distribution (third quartile +
+1.5 × IQR).
+
+```{r aoa}
+shap_weights <- read_csv(file.path(MODEL_DIR, "ensemble_mean_abs_shap.csv"), show_col_types = FALSE)
+aoa_feats <- shap_weights$feature
+stopifnot(all(aoa_feats %in% model_feats))
+
+centers <- map_dbl(aoa_feats, \(f) mean(train_pool[[f]], na.rm = TRUE))
+scales <- map_dbl(aoa_feats, \(f) sd(train_pool[[f]], na.rm = TRUE))
+weights <- shap_weights$mean_abs_shap
+
+to_aoa_space <- function(df) {
+  X <- as.matrix(df[, aoa_feats])
+  X <- sweep(sweep(X, 2, centers), 2, scales, "/")
+  sweep(X, 2, weights, "*")
+}
+
+# the handful of training rows missing a weather summary (~0.1%) can't be
+# placed in feature space and are left out of the reference
+train_X <- to_aoa_space(train_pool)
+train_complete <- complete.cases(train_X)
+train_X <- train_X[train_complete, ]
+log("AOA reference: %s of %s CV-pool rows complete", nrow(train_X), length(train_complete))
+
+# mean pairwise distance within the training pool
+d_bar <- mean(dist(train_X))
+
+# cross-fold nearest-neighbor DI for the threshold
+train_fold <- train_pool$holdout_part[train_complete]
+train_di <- numeric(nrow(train_X))
+for (k in unique(train_fold)) {
+  in_k <- train_fold == k
+  train_di[in_k] <- nn2(train_X[!in_k, ], train_X[in_k, ], k = 1)$nn.dists[, 1] / d_bar
+}
+aoa_threshold <- boxplot.stats(train_di)$stats[5]
+
+compute_di <- function(df) {
+  di <- rep(NA_real_, nrow(df))
+  X <- to_aoa_space(df)
+  ok <- complete.cases(X)
+  di[ok] <- nn2(train_X, X[ok, , drop = FALSE], k = 1)$nn.dists[, 1] / d_bar
+  di
+}
+
+log("AOA threshold (DI): %.3f", aoa_threshold)
+```
+
+## Apply the filters
+
+A failed check flags an observation as outside the conditions the model was
+trained on. Its estimate is then an extrapolation and may be poor, but it is
+not necessarily wrong. The counts below are of estimates inside the training
+domain on every check; the per-row flags, the DI, and the inputs outside their
+training range are exported with the estimates so that users can set their own
+cutoffs.
+
+Each step is counted in location-days: the number of distinct
+(location, date) pairs with at least one observation remaining. When more than
+one scene passes at a location on the same day (overlapping paths, or several
+`siteSR_id`s at one location), the day's estimate is their mean.
+
+```{r filter-steps}
+model_input <- model_input %>%
+  mutate(pass_region = in_region(.),
+         pass_mission = pass_region & mission %in% TRAINING_MISSIONS,
+         pass_season = pass_mission & in_season(.),
+         pass_complete = pass_season & feature_complete(.),
+         pass_range = pass_complete & in_range(.),
+         out_of_range = out_of_range(.),
+         di = compute_di(.),
+         pass_aoa = pass_range & !is.na(di) & di <= aoa_threshold,
+         pass_plausible = pass_aoa & pred_sdd >= min(train_pool$harmonized_value))
+
+count_step <- function(df, step) {
+  tibble(step = step, location_days = nrow(distinct(df, location_id, date)),
+         locations = n_distinct(df$location_id))
+}
+
+filter_steps <- bind_rows(
+  count_step(sitesr_raw_location_days, "siteSR observations (before QA)"),
+  count_step(model_input, "After siteSR QA"),
+  count_step(filter(model_input, pass_region), "Inside training region"),
+  count_step(filter(model_input, pass_mission), "Landsat mission represented in training"),
+  count_step(filter(model_input, pass_season), "Within seasonal window of training matchups"),
+  count_step(filter(model_input, pass_complete), "All model inputs available"),
+  count_step(filter(model_input, pass_range), "Within training range of every input"),
+  count_step(filter(model_input, pass_aoa), "Inside area of applicability"),
+  count_step(filter(model_input, pass_plausible), "Estimate no shallower than training minimum")
+)
+filter_steps
+
+rs_estimates <- model_input %>%
+  filter(pass_plausible) %>%
+  summarise(pred_sdd = mean(pred_sdd),
+            pred_seed_sd = mean(pred_seed_sd),
+            di = max(di),
+            n_scenes = n(),
+            .by = c(location_id, date))
+```
+
+## Export
+
+Write the application outputs:
+
+- the step-by-step filter counts;
+- the per-location-day remote sensing estimates;
+- the in situ location-days for comparison;
+- location coordinates;
+- per-row pass/fail flags for every check, with the DI and the names of any
+  inputs outside their training range.
+
+The applicability checks themselves are written alongside the model, to
+`xg_models/v3_band_only/applicability/`, so anyone applying the model can
+screen their own observations without the training data:
+
+- `aoa_parameters.json`: the AOA threshold and mean training distance; the
+  AOA features with their standardization centers, scales, and |SHAP|
+  weights; the training range of every model input; the seasonal window; the
+  training missions; and the training minimum SDD;
+- `aoa_reference.csv`: the training reference already transformed into AOA
+  space (standardized and weighted), one row per CV-pool matchup, which is
+  what a new observation's nearest-neighbor distance is measured against;
+- `training_region.geojson`: the training region footprint for the region
+  check.
+
+```{r export}
+locations <- station_sites %>%
+  summarise(lat = mean(WGS84_Latitude), lon = mean(WGS84_Longitude), .by = location_id)
+
+write_csv(filter_steps, file.path(OUT_DIR, "application_filter_steps.csv"))
+write_parquet(rs_estimates, file.path(OUT_DIR, "application_rs_estimates.parquet"))
+write_parquet(insitu_location_days, file.path(OUT_DIR, "application_insitu_location_days.parquet"))
+write_parquet(locations, file.path(OUT_DIR, "application_locations.parquet"))
+write_parquet(model_input %>%
+                select(location_id, date, mission, pass_region, pass_mission, pass_season, pass_complete, pass_range,
+                       out_of_range, pass_aoa, pass_plausible, di),
+              file.path(OUT_DIR, "application_row_flags.parquet"))
+log("wrote application outputs to %s", OUT_DIR)
+
+APPLICABILITY_DIR <- file.path(MODEL_DIR, "applicability")
+dir.create(APPLICABILITY_DIR, showWarnings = FALSE)
+write_json(list(aoa_threshold = aoa_threshold,
+                d_bar = d_bar,
+                aoa_features = tibble(feature = aoa_feats, center = centers,
+                                      scale = scales, weight = weights),
+                feature_ranges = feature_ranges,
+                season_window_doy = unname(season_window),
+                training_missions = TRAINING_MISSIONS,
+                min_training_sdd_m = min(train_pool$harmonized_value)),
+           file.path(APPLICABILITY_DIR, "aoa_parameters.json"),
+           auto_unbox = TRUE, digits = I(17), pretty = TRUE)
+write_csv(as_tibble(train_X), file.path(APPLICABILITY_DIR, "aoa_reference.csv"))
+training_region_path <- file.path(APPLICABILITY_DIR, "training_region.geojson")
+if (file.exists(training_region_path)) file.remove(training_region_path)
+st_write(st_sf(geometry = training_region), training_region_path, quiet = TRUE,
+         layer_options = "COORDINATE_PRECISION=6")
+log("wrote applicability checks to %s", APPLICABILITY_DIR)
+```
+
+## Model performance on superseded matchups
+
+This is a true side-quest: `02a_make_matches.Rmd` pairs each in situ SDD sample with every rain-screened
+siteSR observation within ±5 days, keeps the one closest in time for
+training, and sets the rest aside (`regional_sdd_not_closest.parquet`). Those
+superseded matchups are real image–field pairs that passed every upstream
+filter but never entered model training as rows, which makes them a direct
+test of the application setting: an image reflectance sumamry that is not the one the model was
+trained on, at a monitored location. Each in situ sample behind them also has
+a closest-in-time match in the training data, so the field value itself is
+not new to the model at sites in the cross-validation pool, rather the reflectance
+summaries are new to the model. The performance of the model across these
+data represent something between a true hold out spatially and members of 
+other cross-validation groups - so it should land somewhere between the 
+cross-validation statisitcs and the test set statistics. 
+
+Features follow `03_split_data.ipynb` exactly: harmonized bands from the
+matchup, the same site characteristics, and antecedent weather anchored on the
+later of the image and field dates. The 40-model ensemble is applied as
+above, and the same applicability checks and plausibility floor are applied
+as in the regional application.
+
+```{r superseded-performance}
+superseded <- read_parquet(file.path(AQUAMATCH_DIR, "regional_sdd_not_closest.parquet")) %>%
+  transmute(siteSR_id, date = as.Date(date), mission, obs = harmonized_value,
+            field_date = as.Date(harmonized_local_time, tz = "UTC"),
+            anchor_date = pmax(date, field_date),
+            red_corr7 = red_corr_7, green_corr7 = green_corr_7, blue_corr7 = blue_corr_7,
+            nir_corr7 = nir_corr_7, swir1_corr7 = swir1_corr_7, swir2_corr7 = swir2_corr_7,
+            temp_corr7 = surfacetemp_corr_7,
+            atm_corr_LaSRC = as.integer(mission %in% c("LC08", "LC09"))) %>%
+  left_join(site_char, by = "siteSR_id") %>%
+  left_join(site_cells %>% select(siteSR_id, cell_id), by = "siteSR_id") %>%
+  left_join(as.data.frame(weather_summaries), by = c("cell_id", "anchor_date" = "date")) %>%
+  add_features() %>%
+  as_tibble()
+
+superseded$pred <- map(ENSEMBLE_SEEDS, \(s) {
+  X <- as.matrix(superseded[, seed_feats[[as.character(s)]]])
+  map(1:4, \(fold) {
+    predict(xgb.load(file.path(MODEL_DIR, paste0("seed", s), paste0("xgboost_fold", fold, ".json"))), X)
+  })
+}) %>%
+  list_flatten() %>%
+  do.call(cbind, .) %>%
+  rowMeans()
+
+superseded <- superseded %>%
+  left_join(training %>% distinct(siteSR_id, is_holdout), by = "siteSR_id") %>%
+  left_join(sites_meta %>% distinct(siteSR_id, WGS84_Latitude, WGS84_Longitude), by = "siteSR_id") %>%
+  mutate(pass_region = in_region(.),
+         pass_mission = pass_region & mission %in% TRAINING_MISSIONS,
+         pass_season = pass_mission & in_season(.),
+         pass_complete = pass_season & feature_complete(.),
+         pass_range = pass_complete & in_range(.),
+         di = compute_di(.),
+         pass_aoa = pass_range & !is.na(di) & di <= aoa_threshold,
+         pass_plausible = pass_aoa & pred >= min(train_pool$harmonized_value))
+
+log("superseded matchups: %s rows at %s sites (%s at holdout sites); %s pass every check",
+    nrow(superseded), n_distinct(superseded$siteSR_id), sum(superseded$is_holdout, na.rm = TRUE),
+    sum(superseded$pass_plausible))
+
+superseded_metrics <- function(df) {
+  summarise(df, n = n(),
+            rmse = sqrt(mean((pred - obs)^2)),
+            mae = mean(abs(pred - obs)),
+            bias = mean(pred - obs),
+            r2 = cor(pred, obs)^2)
+}
+
+superseded_validation <- bind_rows(
+  superseded %>%
+    mutate(group = case_when(!pass_range ~ "outside region, season, or training range",
+                             !pass_aoa ~ "outside AOA",
+                             !pass_plausible ~ "below plausibility floor",
+                             TRUE ~ "passes all checks")),
+  superseded %>% mutate(group = "all superseded")
+) %>%
+  mutate(sites = if_else(is_holdout, "holdout sites", "CV-pool sites")) %>%
+  bind_rows(mutate(., sites = "all sites")) %>%
+  group_by(sites, group) %>%
+  superseded_metrics() %>%
+  ungroup()
+
+write_csv(superseded_validation, file.path(OUT_DIR, "superseded_validation.csv"))
+write_parquet(superseded %>% select(siteSR_id, date, field_date, mission, obs, pred, is_holdout, di, starts_with("pass_")),
+              file.path(OUT_DIR, "superseded_predictions.parquet"))
+superseded_validation %>% mutate(across(c(rmse, mae, bias, r2), ~ round(.x, 3)))
+```
+
+Plot ensemble estimates against in situ SDD for the superseded matchups that
+pass every check. Panels show all sites, holdout sites, and
+cross-validation-pool sites, each annotated with its error metrics. The
+dashed line is 1:1.
+
+```{r superseded-plot, fig.width=10, fig.height=4.5}
+superseded_passing <- superseded %>%
+  filter(pass_plausible) %>%
+  mutate(sites = if_else(is_holdout, "holdout sites", "CV-pool sites")) %>%
+  bind_rows(mutate(., sites = "all sites")) %>%
+  mutate(sites = factor(sites, levels = c("all sites", "holdout sites", "CV-pool sites")))
+
+panel_labels <- superseded_validation %>%
+  filter(group == "passes all checks") %>%
+  mutate(sites = factor(sites, levels = levels(superseded_passing$sites)),
+         label = sprintf("n = %s\nRMSE = %.2f m\nMAE = %.2f m\nbias = %+.2f m\nR² = %.2f",
+                         format(n, big.mark = ",", trim = TRUE), rmse, mae, bias, r2))
+
+axis_max <- ceiling(max(superseded_passing$obs, superseded_passing$pred))
+
+ggplot(superseded_passing, aes(obs, pred)) +
+  geom_abline(linetype = "dashed", colour = "grey50") +
+  geom_point(alpha = 0.3, size = 1.25) +
+  geom_text(data = panel_labels, aes(x = 0, y = axis_max, label = label),
+            hjust = 0, vjust = 1, size = 3.2, lineheight = 0.9) +
+  coord_equal(xlim = c(0, axis_max), ylim = c(0, axis_max)) +
+  facet_wrap(~ sites) +
+  labs(x = "in situ SDD (m)", y = "ensemble estimate (m)",
+       title = "Superseded matchups that pass every applicability check") +
+  theme_bw()
+```
+
+## Comparison with production
+
+Step 07's outputs are read from `aquamatch_files/application/`. Both scripts
+start from the same QA'd observations, so differences in the filter cascade
+come only from checks 5–8, which depend on each model's inputs.
+
+```{r compare-filter-steps}
+prod_filter_steps <- read_csv(file.path(PRODUCTION_OUT_DIR, "application_filter_steps.csv"),
+                              show_col_types = FALSE)
+
+filter_steps %>%
+  select(step, band_only_location_days = location_days, band_only_locations = locations) %>%
+  left_join(prod_filter_steps %>%
+              select(step, production_location_days = location_days, production_locations = locations),
+            by = "step")
+```
+
+Superseded-matchup performance, by site group and check outcome, for both
+models. Each model's own checks define its "passes all checks" group, so the
+groups can contain different matchups.
+
+```{r compare-superseded}
+prod_superseded <- read_csv(file.path(PRODUCTION_OUT_DIR, "superseded_validation.csv"),
+                            show_col_types = FALSE)
+
+superseded_validation %>%
+  full_join(prod_superseded, by = c("sites", "group"), suffix = c("_band_only", "_production")) %>%
+  select(sites, group, starts_with("n_"), starts_with("rmse_"), starts_with("bias_"), starts_with("r2_")) %>%
+  mutate(across(where(is.double), ~ round(.x, 3)))
+```
+
+On the matchups that pass every check for *both* models, the comparison is
+paired: the same image–field pairs, scored by each model.
+
+```{r compare-superseded-paired}
+prod_superseded_preds <- read_parquet(file.path(PRODUCTION_OUT_DIR, "superseded_predictions.parquet"))
+
+# both scripts build the superseded table from the same parquet in the same
+# order, so rows align one-to-one
+key_cols <- c("siteSR_id", "date", "field_date", "mission", "obs")
+stopifnot(identical(as.data.frame(superseded[, key_cols]), as.data.frame(prod_superseded_preds[, key_cols])))
+
+superseded_paired <- superseded %>%
+  select(all_of(key_cols), is_holdout, pred_band_only = pred, pass_band_only = pass_plausible) %>%
+  mutate(pred_production = prod_superseded_preds$pred,
+         pass_production = prod_superseded_preds$pass_plausible) %>%
+  filter(pass_band_only, pass_production)
+
+superseded_paired %>%
+  mutate(sites = if_else(is_holdout, "holdout sites", "CV-pool sites")) %>%
+  bind_rows(mutate(., sites = "all sites")) %>%
+  pivot_longer(c(pred_band_only, pred_production), names_to = "model", names_prefix = "pred_",
+               values_to = "pred") %>%
+  group_by(sites, model) %>%
+  superseded_metrics() %>%
+  ungroup() %>%
+  mutate(across(c(rmse, mae, bias, r2), ~ round(.x, 3)))
+```
+
+Finally, the estimates themselves: at location-days where both models
+produce an estimate, how closely do they agree?
+
+```{r compare-estimates}
+prod_estimates <- read_parquet(file.path(PRODUCTION_OUT_DIR, "application_rs_estimates.parquet"))
+
+estimates_paired <- rs_estimates %>%
+  select(location_id, date, band_only = pred_sdd) %>%
+  inner_join(prod_estimates %>% select(location_id, date, production = pred_sdd),
+             by = c("location_id", "date"))
+
+tibble(band_only_location_days = nrow(rs_estimates),
+       production_location_days = nrow(prod_estimates),
+       shared_location_days = nrow(estimates_paired),
+       mean_difference_m = mean(estimates_paired$production - estimates_paired$band_only),
+       sd_difference_m = sd(estimates_paired$production - estimates_paired$band_only),
+       correlation = cor(estimates_paired$production, estimates_paired$band_only)) %>%
+  pivot_longer(everything(), names_to = "statistic", values_to = "value",
+               values_transform = as.double) %>%
+  mutate(value = round(value, 3))
+```

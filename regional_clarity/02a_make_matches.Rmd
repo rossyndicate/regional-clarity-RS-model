@@ -60,48 +60,32 @@ Use the regionally band-filtered siteSR data (rather than the full
 nationwide `unified_data`) as the input to matching, so a site flagged in
 script 01 simply isn't a match candidate.
 
-`match_siteSR_to_WQP()` only accepts `.csv`/`.feather` for its WQP input and
-hard-codes `.feather` for its siteSR input - parquet isn't a supported input
-format for this AquaMatchr function. Our filtered caches from script 01 are
-parquet (see that script's note on preferring parquet everywhere it isn't
-required to be otherwise), so we write throwaway feather copies just for
-this call and delete them immediately after.
-
-Only SDD observations that RANSAC kept (or could not evaluate) are passed
-to the matcher. Every siteSR observation at the same site within ±5 days of
-an SDD sample becomes a candidate matchup. The result is cached, so later
-renders read it from disk.
+`match_siteSR_to_WQP()` reads the parquet caches from script 01 directly.
+Every siteSR observation at the same site within ±5 days of an SDD sample
+becomes a candidate matchup. Only matchups for SDD observations that RANSAC
+kept (or could not evaluate) are retained; filtering the matchups on the
+carried-through `is_inlier` column is equivalent to filtering the SDD input
+before matching. The result is cached, so later renders read it from disk.
 
 ```{r run-siteSR-wqp-match, message = FALSE, warning=FALSE}
 out_file <- file.path(filtered_aquamatch_dir, "sdd_regional_siteSR_matchups_5d.parquet")
 
-if (file.exists(out_file)) {
-  sdd_match <- read_parquet(out_file)
-} else {
-  # throwaway feather copies, required by match_siteSR_to_WQP()'s input format
-  sdd_filtered_feather <- tempfile(fileext = ".feather")
-  siteSR_regional_filtered_feather <- tempfile(fileext = ".feather")
-  # is_inlier == FALSE is a RANSAC-flagged SDD outlier (see
-  # 01_filter_AquaMatch_Data.Rmd); NA (RANSAC never resolved, e.g. too few
-  # points at that site) is kept rather than assumed guilty
-  write_feather(read_parquet(sdd_filtered_path) %>%
-                  filter(is_inlier | is.na(is_inlier)),
-                sdd_filtered_feather)
-  write_feather(read_parquet(siteSR_regional_filtered_path), siteSR_regional_filtered_feather)
-  
+if (!file.exists(out_file)) {
   # Run the matchups with a 5-day window
   match_siteSR_to_WQP(
-    wqp_path = sdd_filtered_feather,
-    siteSR_path = siteSR_regional_filtered_feather,
+    wqp_path = sdd_filtered_path,
+    siteSR_path = siteSR_regional_filtered_path,
     site_list_path = sr_sites,
-    save_location = out_file,
+    output_file = out_file,
     time_window = "5 days"
   )
-  
-  file.remove(sdd_filtered_feather, siteSR_regional_filtered_feather)
-  
-  sdd_match <- read_parquet(out_file)
 }
+
+# is_inlier == FALSE is a RANSAC-flagged SDD outlier (see
+# 01_filter_AquaMatch_Data.Rmd); NA (RANSAC never resolved, e.g. too few
+# points at that site) is kept rather than assumed guilty
+sdd_match <- read_parquet(out_file) %>%
+  filter(is_inlier | is.na(is_inlier))
 
 ```
 
@@ -154,7 +138,7 @@ Map every site with at least one matchup.
 tm_shape(conus) +
   tm_borders() +
   tm_shape(lake_locs_CONUS) +
-  tm_dots()
+  tm_dots(size = 0.375)
 ```
 
 Count matchups per site and attach the counts to the site locations.
@@ -183,7 +167,7 @@ tm_shape(conus) +
           fill.scale = tm_scale(breaks = c(1, 10, 25, 50, 75, 100,
                                            500, 1000, 1500),
                                 values = "viridis"),
-          size = 0.5,
+          size = 0.625,
           fill_alpha = 0.5) +
   tm_layout(legend.position = tm_pos_in("right", "bottom"),
             legend.bg.color = "white",
@@ -233,7 +217,7 @@ tm_shape(conus) +
           fill.legend = tm_legend(position = tm_pos_on_top(pos.h = "right", pos.v = "bottom"),
                                   bg.color = "white",
                                   frame = TRUE, text.size = 1),
-          size = 0.5,
+          size = 0.625,
           fill_alpha = 0.5) +
   tm_facets_wrap(by = "mission_label", ncol = 2, nrow = 3)
 ```
@@ -463,7 +447,7 @@ regional_long_record <- regional_site_summary %>%
   left_join(., reg_sdd_closest)
 
 ggplot(regional_long_record, aes(x = date, y = harmonized_value)) +
-  geom_point() +
+  geom_point(size = 1.875) +
   facet_wrap(siteSR_id ~ .) +
   theme_bw()
 ```
@@ -481,7 +465,8 @@ tm_shape(HUC4_filtered) +
   tm_shape(regional_site_summary %>%
              st_transform(st_crs(HUC4_filtered))) +
   tm_dots("n",
-          fill.scale = tm_scale_continuous(values = "viridis"))
+          fill.scale = tm_scale_continuous(values = "viridis"),
+          size = 0.375)
 ```
 
 Summarize the final matchups by HUC4. Basins with no matchups are outlined

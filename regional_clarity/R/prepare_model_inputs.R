@@ -1,8 +1,11 @@
-# Build model-ready inputs for the regional clarity SDD ensemble.
+# Build model-ready inputs for the regional clarity SDD ensembles.
 #
-# The model needs, for each siteSR observation: the Landsat 7-harmonized
-# bands, the atmospheric-correction flag, site characteristics (elevation,
-# LakeCat catchment metrics, shore_flag), and antecedent gridMET weather.
+# The production model needs, for each siteSR observation: the Landsat
+# 7-harmonized bands, the atmospheric-correction flag, site characteristics
+# (elevation, LakeCat catchment metrics, shore_flag), and antecedent gridMET
+# weather. The band-only model needs only the bands and the flag; pass
+# `site_and_weather = FALSE` to prepare_model_inputs() to skip the two web
+# services.
 # These functions assemble that table from AquaMatch siteSR data and the two
 # web services, following 02b_pull_site_characteristics.Rmd and
 # 02c_pull_weather_summaries.Rmd. 07_regional_application.Rmd uses them for
@@ -13,6 +16,8 @@
 #
 #   source("regional_clarity/R/prepare_model_inputs.R")
 #   model_input <- prepare_model_inputs(sites, sitesr_rows)
+#   # band-only model:
+#   model_input <- prepare_model_inputs(sites, sitesr_rows, site_and_weather = FALSE)
 #
 # then predict and screen with regional_clarity/python/apply_model.py (or
 # with the same steps in 07_regional_application.Rmd).
@@ -20,9 +25,13 @@
 # `sites`: one row per siteSR_id, columns siteSR_id, WGS84_Latitude,
 #   WGS84_Longitude, wb_nhd_id (NHDPlusV2 COMID), wb_nhd_source,
 #   flag_wb, flag_optical_shoreline - as in AquaMatch's siteSR site table.
+#   With site_and_weather = FALSE, only siteSR_id and the coordinates are
+#   used. The coordinates are carried into the output for the training-region
+#   check.
 # `sitesr_rows`: siteSR observations that passed the scene QA in
-#   01_filter_AquaMatch_Data.Rmd, columns siteSR_id, date, mission,
-#   {red,green,blue,nir,swir1,swir2}_corr_7, surfacetemp_corr_7.
+#   01_filter_AquaMatch_Data.Rmd (see R/siteSR_qa.R), columns siteSR_id,
+#   date, mission, {red,green,blue,nir,swir1,swir2}_corr_7,
+#   surfacetemp_corr_7.
 
 library(tidyverse)
 library(sf)
@@ -203,8 +212,10 @@ summarize_weather <- function(weather_raw) {
 
 # Spectral indices and site-feature coarsening: R ports of
 # python/features.py (add_spectral_indices() and coarsen_site_features()).
+# Coarsening applies to whichever site columns are present, so band-only
+# inputs (no site columns) pass through unchanged.
 add_features <- function(df) {
-  df %>%
+  df <- df %>%
     mutate(BR = blue_corr7 / red_corr7,
            BG = blue_corr7 / green_corr7,
            NR = nir_corr7 / red_corr7,
@@ -214,43 +225,66 @@ add_features <- function(df) {
            NDSSI = (blue_corr7 - nir_corr7) / (blue_corr7 + nir_corr7),
            NDWI = (green_corr7 - nir_corr7) / (green_corr7 + nir_corr7),
            MNDWI = (green_corr7 - swir1_corr7) / (green_corr7 + swir1_corr7)) %>%
-    mutate(across(c(BR, BG, NR, GR, fai, NDVI, NDSSI, NDWI, MNDWI), ~ if_else(is.finite(.x), .x, NA_real_)),
-           catchment_area_sqkm = if_else(catchment_area_sqkm > 0,
-                                         10^round(log10(pmin(catchment_area_sqkm, CATCHMENT_WINSORIZE_CAP_SQKM)), 1),
-                                         catchment_area_sqkm),
-           across(c(pct_impervious_2006, pct_urban_2006, pct_forest_2006,
-                    pct_cropland_2006, pct_wetland_2006), ~ round(.x, 0)))
+    mutate(across(c(BR, BG, NR, GR, fai, NDVI, NDSSI, NDWI, MNDWI), ~ if_else(is.finite(.x), .x, NA_real_)))
+  if ("catchment_area_sqkm" %in% names(df)) {
+    df <- df %>%
+      mutate(catchment_area_sqkm = if_else(catchment_area_sqkm > 0,
+                                           10^round(log10(pmin(catchment_area_sqkm, CATCHMENT_WINSORIZE_CAP_SQKM)), 1),
+                                           catchment_area_sqkm))
+  }
+  df %>%
+    mutate(across(any_of(c("pct_impervious_2006", "pct_urban_2006", "pct_forest_2006",
+                           "pct_cropland_2006", "pct_wetland_2006")), ~ round(.x, 0)))
 }
 
 
 # One model-input row per siteSR observation: harmonized bands, the LaSRC
 # flag, site characteristics, and the antecedent weather for the site's
 # gridMET cell on the image date, then spectral indices and coarsening.
-# `keep` lists extra sitesr_rows columns to carry through.
-assemble_model_inputs <- function(sitesr_rows, site_char, site_cells, weather_summaries, keep = character()) {
-  sitesr_rows %>%
+# `keep` lists extra sitesr_rows columns to carry through. Leave site_char,
+# or site_cells and weather_summaries, as NULL to skip those joins (band-only
+# inputs).
+assemble_model_inputs <- function(sitesr_rows, site_char = NULL, site_cells = NULL, weather_summaries = NULL,
+                                  keep = character()) {
+  df <- sitesr_rows %>%
     select(siteSR_id, date, mission, all_of(keep),
            red_corr7 = red_corr_7, green_corr7 = green_corr_7, blue_corr7 = blue_corr_7,
            nir_corr7 = nir_corr_7, swir1_corr7 = swir1_corr_7, swir2_corr7 = swir2_corr_7,
            temp_corr7 = surfacetemp_corr_7) %>%
     mutate(date = as.Date(date),
-           atm_corr_LaSRC = as.integer(mission %in% c("LC08", "LC09"))) %>%
-    left_join(site_char, by = "siteSR_id") %>%
-    left_join(site_cells %>% select(siteSR_id, cell_id), by = "siteSR_id") %>%
-    left_join(as.data.frame(weather_summaries), by = c("cell_id", "date")) %>%
+           atm_corr_LaSRC = as.integer(mission %in% c("LC08", "LC09")))
+  if (!is.null(site_char)) {
+    df <- df %>% left_join(site_char, by = "siteSR_id")
+  }
+  if (!is.null(weather_summaries)) {
+    df <- df %>%
+      left_join(site_cells %>% select(siteSR_id, cell_id), by = "siteSR_id") %>%
+      left_join(as.data.frame(weather_summaries), by = c("cell_id", "date"))
+  }
+  df %>%
     add_features() %>%
     as_tibble()
 }
 
 
 # All of the above in one call. Weather for cells that fail to fetch is left
-# missing, so those rows fail the completeness check downstream.
-prepare_model_inputs <- function(sites, sitesr_rows, keep = character(), n_workers = 8) {
-  sites <- sites %>% filter(siteSR_id %in% unique(sitesr_rows$siteSR_id))
+# missing, so those rows fail the completeness check downstream. With
+# site_and_weather = FALSE, nothing is fetched and the output holds only the
+# band-only model's inputs. Either way, each row carries its site's
+# WGS84_Latitude and WGS84_Longitude for the training-region check.
+prepare_model_inputs <- function(sites, sitesr_rows, keep = character(), n_workers = 8,
+                                 site_and_weather = TRUE) {
   sitesr_rows <- sitesr_rows %>% mutate(date = as.Date(date))
+  sites <- sites %>% filter(siteSR_id %in% unique(sitesr_rows$siteSR_id))
+  site_coords <- sites %>% distinct(siteSR_id, WGS84_Latitude, WGS84_Longitude)
+  if (!site_and_weather) {
+    return(assemble_model_inputs(sitesr_rows, keep = keep) %>%
+             left_join(site_coords, by = "siteSR_id"))
+  }
   site_char <- fetch_site_characteristics(sites)
   site_cells <- gridmet_cells(sites)
   weather <- fetch_gridmet(gridmet_cell_ranges(sitesr_rows, site_cells), n_workers = n_workers)
   if (nrow(weather$failed) > 0) warning(nrow(weather$failed), " gridMET cells failed to fetch")
-  assemble_model_inputs(sitesr_rows, site_char, site_cells, summarize_weather(weather$weather), keep = keep)
+  assemble_model_inputs(sitesr_rows, site_char, site_cells, summarize_weather(weather$weather), keep = keep) %>%
+    left_join(site_coords, by = "siteSR_id")
 }

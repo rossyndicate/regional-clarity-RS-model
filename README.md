@@ -43,7 +43,14 @@ Access software:
 
 ## Model card
 
-The model card for the production ensemble is [`regional_clarity/xg_models/v3_production/README.md`](regional_clarity/xg_models/v3_production/README.md). It is formatted for the Hugging Face Hub (YAML metadata, including evaluation results), so that folder can be pushed to the Hub as is. The Quarto site shows the same file as its [Model card](https://rossyndicate.github.io/regional-clarity-RS-model/model_card.html) page (`model_card.qmd`), so edit the card in the model folder only.
+Each published model has its own model card in its model folder:
+
+| Model | Model card | Site page | Hugging Face Hub |
+|---|---|---|---|
+| Production (bands, catchment, weather) | [`regional_clarity/xg_models/v3_production/README.md`](regional_clarity/xg_models/v3_production/README.md) | [`model_card.qmd`](https://rossyndicate.github.io/regional-clarity-RS-model/model_card.html) | [`bgsteele/intermountain-west-regional-clarity-sdd-landsat`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat) |
+| Band-only | [`regional_clarity/xg_models/v3_band_only/README.md`](regional_clarity/xg_models/v3_band_only/README.md) | [`model_card_band_only.qmd`](https://rossyndicate.github.io/regional-clarity-RS-model/model_card_band_only.html) | [`bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only) |
+
+The cards are formatted for the Hugging Face Hub (YAML metadata, including evaluation results), so each model folder can be pushed to the Hub as is. The Quarto site includes the same files, so edit each card in its model folder only.
 
 ## Workflow
 
@@ -116,14 +123,15 @@ Each file opens with a header listing its purpose, inputs, outputs, the working 
 
 ## Applying the model to your own data
 
-The production model folder ([`regional_clarity/xg_models/v3_production/`](regional_clarity/xg_models/v3_production/), also on the Hugging Face Hub) holds only the fitted ensemble and the files the applicability checks need. The code for applying the model lives in this repository:
+Each model folder ([`regional_clarity/xg_models/v3_production/`](regional_clarity/xg_models/v3_production/) and [`regional_clarity/xg_models/v3_band_only/`](regional_clarity/xg_models/v3_band_only/), also on the Hugging Face Hub) holds only the fitted ensemble and the files the applicability checks need. The code for applying either model lives in this repository:
 
 | File | Language | What it does |
 |---|---|---|
-| [`regional_clarity/R/prepare_model_inputs.R`](regional_clarity/R/prepare_model_inputs.R) | R | Build model inputs from AquaMatch siteSR sites and QA'd observations: elevation, LakeCat catchment metrics, gridMET antecedent weather, spectral indices, and site-feature coarsening. Step 07 uses the same functions. |
-| [`regional_clarity/python/apply_model.py`](regional_clarity/python/apply_model.py) | Python | Load the 40-booster ensemble, predict SDD, and run the applicability checks against the model folder's `applicability/` files. |
+| [`regional_clarity/R/siteSR_qa.R`](regional_clarity/R/siteSR_qa.R) | R | Apply the training data's observation QA to siteSR sites and observations: site geometry, pixel, temperature, and scene QA, and the per-site band-outlier filter. Step 01 uses the same functions. |
+| [`regional_clarity/R/prepare_model_inputs.R`](regional_clarity/R/prepare_model_inputs.R) | R | Build model inputs from AquaMatch siteSR sites and QA'd observations: elevation, LakeCat catchment metrics, gridMET antecedent weather, spectral indices, and site-feature coarsening. `site_and_weather = FALSE` builds the band-only model's inputs without the web fetches. Steps 07 and 07b use the same functions. |
+| [`regional_clarity/python/apply_model.py`](regional_clarity/python/apply_model.py) | Python | Load either 40-booster ensemble, predict SDD, and flag observations outside the training domain with the applicability checks, using that model folder's `applicability/` files. |
 
-The [model card](regional_clarity/xg_models/v3_production/README.md#how-to-use) has a worked example.
+Each model card's "How to use" section has a worked example, and the site's [Applying the model](https://rossyndicate.github.io/regional-clarity-RS-model/applying_the_model.html) page walks through the full process.
 
 ## Python environment
 

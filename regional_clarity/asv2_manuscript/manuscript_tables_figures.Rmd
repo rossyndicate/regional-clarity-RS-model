@@ -173,6 +173,7 @@ feature_labels <- c(
   atm_corr_LaSRC = "Atmospheric correction (LaSRC)",
   shore_flag = "Near-shore flag",
   pct_impervious_2006 = "Catchment impervious (%)",
+  pct_forest_2006 = "Catchment forest (%)",
   pct_wetland_2006 = "Catchment wetland (%)"
 )
 category_labels <- c(optical = "Optical", site = "Site/catchment", weather = "Antecedent weather")
@@ -194,7 +195,7 @@ axis_max <- ceiling(max(holdout_preds$obs, holdout_preds$pred))
 
 pred_obs <- ggplot(holdout_preds, aes(obs, pred)) +
   geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey50") +
-  geom_point(alpha = 0.3, size = 1, color = "#002EA3") +
+  geom_point(alpha = 0.3, size = 1.25, color = "#002EA3") +
   coord_equal(xlim = c(0, axis_max), ylim = c(0, axis_max), expand = FALSE) +
   labs(x = "Observed Secchi disc depth (m)", y = "Predicted Secchi disc depth (m)") +
   theme_bw() +

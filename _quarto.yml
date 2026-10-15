@@ -6,6 +6,8 @@ project:
   render:
     - index.qmd
     - model_card.qmd
+    - model_card_band_only.qmd
+    - applying_the_model.qmd
     - regional_clarity/00_download_AquaMatch_data.Rmd
     - regional_clarity/01_filter_AquaMatch_Data.Rmd
     - regional_clarity/02a_make_matches.Rmd
@@ -16,6 +18,10 @@ project:
     - regional_clarity/05_evaluate_ensemble.ipynb
     - regional_clarity/06_test_set_sensitivity.ipynb
     - regional_clarity/07_regional_application.Rmd
+    - regional_clarity/04b_make_models_band_only.ipynb
+    - regional_clarity/05b_evaluate_ensemble_band_only.ipynb
+    - regional_clarity/06b_test_set_sensitivity_band_only.ipynb
+    - regional_clarity/07b_regional_application_band_only.Rmd
 
 # Rmds execute once, then reuse the stored results in _freeze/ until their
 # source changes. Notebooks are never executed: their saved outputs are used.
@@ -35,8 +41,14 @@ website:
     contents:
       - text: "Overview"
         href: index.qmd
-      - text: "Model card"
-        href: model_card.qmd
+      - section: "Model cards"
+        contents:
+          - text: "Production"
+            href: model_card.qmd
+          - text: "Band-only"
+            href: model_card_band_only.qmd
+      - text: "Applying the model"
+        href: applying_the_model.qmd
       - section: "Data preparation (R)"
         contents:
           - text: "00 · Download AquaMatch data"
@@ -63,6 +75,16 @@ website:
         contents:
           - text: "07 · Regional application of the ensemble"
             href: regional_clarity/07_regional_application.Rmd
+      - section: "Band-only baseline"
+        contents:
+          - text: "04b · Make models (band-only)"
+            href: regional_clarity/04b_make_models_band_only.ipynb
+          - text: "05b · Evaluate the ensemble (band-only)"
+            href: regional_clarity/05b_evaluate_ensemble_band_only.ipynb
+          - text: "06b · Test-set sensitivity (band-only)"
+            href: regional_clarity/06b_test_set_sensitivity_band_only.ipynb
+          - text: "07b · Regional application (band-only)"
+            href: regional_clarity/07b_regional_application_band_only.Rmd
 
 format:
   html:

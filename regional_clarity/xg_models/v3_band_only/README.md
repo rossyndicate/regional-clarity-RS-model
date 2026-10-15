@@ -1,0 +1,332 @@
+---
+license: mit
+library_name: xgboost
+pipeline_tag: tabular-regression
+tags:
+  - xgboost
+  - tabular-regression
+  - ensemble
+  - remote-sensing
+  - landsat
+  - water-quality
+  - water-clarity
+  - secchi-disc-depth
+  - limnology
+metrics:
+  - rmse
+  - mae
+  - r_squared
+model-index:
+  - name: intermountain-west-regional-clarity-sdd-landsat-band-only
+    results:
+      - task:
+          type: tabular-regression
+          name: Secchi disc depth estimation
+        dataset:
+          name: AquaMatch SDD–Landsat matchups, fixed HUC8 holdout (CO, ID, MT, NM, UT, WY)
+          type: aquamatch-sdd-landsat-matchups
+          split: holdout
+        metrics:
+          - type: rmse
+            value: 1.356
+            name: Holdout RMSE (m)
+          - type: mae
+            value: 1.002
+            name: Holdout MAE (m)
+          - type: r_squared
+            value: 0.565
+            name: Holdout R²
+---
+
+# Intermountain West Regional Secchi Disc Depth Model: Band-Only
+
+An ensemble of 40 XGBoost regressors that estimates Secchi disc depth (SDD, in meters) for lakes and reservoirs from Landsat Collection 2 surface reflectance alone. Its inputs are the harmonized bands, spectral indices, and an atmospheric-correction flag, all derived from the Landsat observation itself. It needs no catchment or weather data. The model covers six states in the intermountain West (Colorado, Idaho, Montana, New Mexico, Utah, and Wyoming) across Landsat 4, 5, 7, 8, and 9, 1984–2023.
+
+This is the band-only counterpart of the [production model](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat), which also uses antecedent weather and static catchment characteristics. The two were built with the same data, splits, and procedure; only the candidate features differ. See [Related model](#related-model) for a comparison.
+
+On a fixed holdout of whole HUC8 basins that no ensemble member trained on, the model reaches an RMSE of 1.36 m, an MAE of 1.00 m, and an R² of 0.56. It is most accurate below about 6 m SDD and underestimates very clear water (see [Limitations](#limitations)).
+
+The full workflow, with code and outputs for every step, is published at <https://rossyndicate.github.io/regional-clarity-RS-model/>. This model is built in steps 04b–07b.
+
+## Model details
+
+| | |
+|---|---|
+| **Developed by** | B Steele, ROSSyndicate, Colorado State University |
+| **Model type** | Ensemble of gradient-boosted regression trees (XGBoost 3.2, `reg:squarederror`) |
+| **Ensemble** | 10 independent seeds (601–610) × 4 cross-validation folds = 40 boosters; the prediction is their unweighted mean |
+| **Input** | One row per Landsat observation at a waterbody location: harmonized surface reflectance and temperature, spectral indices, and an atmospheric-correction flag (12–13 features per seed; see [Features](#features)) |
+| **Output** | Secchi disc depth, in meters |
+| **License** | MIT |
+| **Source code** | <https://github.com/rossyndicate/regional-clarity-RS-model> |
+| **Contact** | B Steele (repository maintainer) |
+
+## Intended use
+
+**Primary use.** The model estimates SDD for lakes and reservoirs in the six-state region on dates with a usable Landsat overpass. This extends clarity records in space and time beyond in situ sampling. For example, at locations with in situ SDD, the model adds about 671,000 quality-controlled location-days of estimates across 1,821 locations ([step 07b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07b_regional_application_band_only.html)).
+
+**Intended users.** Limnologists, water managers, and researchers who are studying regional and long-term patterns in water clarity.
+
+**Appropriate inputs.** Inputs must be prepared the same way as the training data:
+
+- Landsat Collection 2 surface reflectance from AquaMatch siteSR, using DSWE1 (high-confidence water) pixels;
+- bands harmonized across sensors to the Landsat 7 reference using the AquaMatch handoff coefficients;
+- the same scene QA as the training data;
+- sites inside the training region (the HUC4 basins of the six-state region);
+- open-water-season scenes only;
+- every feature inside the model's area of applicability.
+
+The [Applicability checks](#applicability-checks) section gives the exact criteria.
+
+**Out of scope.**
+
+- Waterbodies outside the six-state region. The model has not been evaluated there. The region check flags these sites, since none of the other checks accounts for geographic distance.
+- Ice-season scenes (outside day of year 70–320).
+- Reflectance products other than AquaMatch siteSR with LS7-referenced harmonization, such as un-harmonized surface reflectance, other atmospheric corrections, or other sensors such as Sentinel-2.
+- Regulatory or compliance decisions for a single waterbody on a single date. Individual estimates carry about ±1.4 m of typical error. The model is better suited to patterns aggregated across dates or sites.
+- Rivers and streams. Training locations are lakes and reservoirs.
+
+## How to use
+
+The model is published on the Hugging Face Hub as [`bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only). The Hub repository holds the fitted ensemble and the files the applicability checks need:
+
+```
+seed601/ … seed610/
+  backward_elim_summary.json   # that seed's selected features ("final_features")
+  final_tune_xgboost.json      # that seed's tuned hyperparameters
+  final_eval_summary.json      # that seed's CV and holdout metrics
+  xgboost_fold{1-4}.json       # the four fitted boosters (XGBoost JSON format)
+ensemble_mean_abs_shap.csv     # ensemble SHAP ranking (also used to weight the AOA check)
+supplemental_feature_table.csv # every candidate feature, its pruning outcome, and which seeds kept it
+applicability/
+  aoa_parameters.json          # AOA threshold and scaling, training ranges, seasonal window, missions
+  aoa_reference.csv            # training observations in AOA space, for the nearest-neighbor DI
+  training_region.geojson      # training region footprint (HUC4 basins), for the region check
+```
+
+The same folder is tracked in the source repository under [`regional_clarity/xg_models/v3_band_only/`](https://github.com/rossyndicate/regional-clarity-RS-model/tree/main/regional_clarity/xg_models/v3_band_only). [Step 05b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/05b_evaluate_ensemble_band_only.html) writes the SHAP ranking and [step 07b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07b_regional_application_band_only.html) writes `applicability/`.
+
+The code for applying the model lives in the [source repository](https://github.com/rossyndicate/regional-clarity-RS-model), not on the Hub, and is shared with the production model. Applying it takes two steps:
+
+1. **Prepare inputs (R).** [`regional_clarity/R/prepare_model_inputs.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/prepare_model_inputs.R) builds one row per observation from AquaMatch siteSR observations that passed siteSR QA. With `site_and_weather = FALSE` it skips the elevation, LakeCat, and gridMET fetches the production model needs, and computes only the band-derived inputs.
+2. **Predict and flag (Python).** [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) loads the 40 boosters from whichever model folder it is given, gives each one its seed's features in order, and returns the ensemble mean. It then runs the [applicability checks](#applicability-checks) against that folder's `applicability/` files.
+
+```r
+source("regional_clarity/R/prepare_model_inputs.R")
+model_input <- prepare_model_inputs(sites, sitesr_rows, site_and_weather = FALSE)   # see the file header for the expected columns
+arrow::write_parquet(model_input, "model_input.parquet")
+```
+
+```python
+import sys
+
+import pandas as pd
+from huggingface_hub import snapshot_download
+
+sys.path.insert(0, "regional_clarity/python")   # from the source repository
+from apply_model import load_ensemble, predict_sdd, check_applicability
+
+model_dir = snapshot_download("bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only")   # or regional_clarity/xg_models/v3_band_only
+X = pd.read_parquet("model_input.parquet")
+X["pred_sdd"] = predict_sdd(load_ensemble(model_dir), X)   # 40 members
+flags = check_applicability(X, model_dir, pred_sdd=X["pred_sdd"])   # one pass_* column per check, plus di and out_of_range
+in_domain = X[flags["pass_all"]]
+```
+
+Always flag with the `applicability/` files from the same model folder you predict with: the two models' training ranges and areas of applicability differ.
+
+To stay in R, follow the prediction and applicability sections of step 07b, which give the same results.
+
+`predict_sdd()` reproduces the published holdout RMSE (1.3558 m) on the training repository's holdout table.
+
+On macOS, set `OMP_NUM_THREADS` and `KMP_DUPLICATE_LIB_OK=TRUE` before importing XGBoost alongside other OpenMP libraries. The [repository README](https://github.com/rossyndicate/regional-clarity-RS-model#python-environment) explains why. Exact package versions are listed in `requirements-lock.txt` in the source repository.
+
+## Training data
+
+The training data are identical to the production model's: matchups between in situ SDD and same-location Landsat observations, from AquaMatch data packages on the Environmental Data Initiative (EDI) repository, all at revision 1:
+
+| EDI package | Product | Used for |
+|---|---|---|
+| [`edi.1856.1`](https://doi.org/10.6073/pasta/542a305e8484ae5abc33881bd7761308) | AquaMatch Secchi disc depth | Target variable (in situ SDD) |
+| [`edi.2254.1`](https://doi.org/10.6073/pasta/f85622d6d32ef7fe6cff8d63c3b947c9) | siteSR | Landsat surface reflectance and temperature at sampling sites, scene-level metadata, and the site list |
+| [`edi.2114.1`](https://doi.org/10.6073/pasta/941f3cb046f5e7fbe04d5811989ed810) | lakeSR | Cross-sensor handoff coefficients used to harmonize all Landsat missions to Landsat 7 |
+
+The matchups were built from these packages in [steps 00–02a](https://rossyndicate.github.io/regional-clarity-RS-model/):
+
+- **SDD quality control.** SDD records were filtered for quality, including per-site RANSAC outlier screening.
+- **Scene QA.** Landsat observations passed scene QA (DSWE share and count, no clouds in the buffer, surface temperature 0–40 °C, scene cloud cover < 20%) and per-site band RANSAC.
+- **Matching.** Each SDD sample was matched to the closest image within ±5 days. A pair was excluded if more than 25.4 mm of rain fell on a single day between the image and the sample.
+- **Harmonization.** Bands from all sensors were harmonized to the Landsat 7 reference.
+
+| | All matchups | CV pool (training) | Holdout |
+|---|---|---|---|
+| Matchups | 11,143 | 8,937 | 2,206 |
+| Sites | 1,462 | 1,081 | 381 |
+| HUC8 basins | 195 | 153 | 42 |
+
+- **Period:** 1984-05-12 to 2023-11-10. About 85% of matchups fall in May–October.
+- **Missions:** Landsat 5 (4,883 matchups), Landsat 7 (4,551), Landsat 8 (1,511), Landsat 9 (150), and Landsat 4 (48).
+- **Target:** SDD ranges from 0.1 to 17.2 m (median 2.9 m, mean 3.3 m). Only 11.6% of matchups exceed 6 m.
+- **Splits:** All splits are by HUC8, so every basin falls entirely on one side of every split ([step 03](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/03_split_data.html)). The holdout is about 20% of HUC8s, drawn once (holdout seed 12) and never used for training, tuning, or feature selection. For each ensemble seed, the remaining HUC8s are reshuffled into four size-balanced CV folds. The holdout and every seed's folds are the same as the production model's.
+
+## Training procedure
+
+Each of the 10 seeds runs the full pipeline independently ([step 04b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/04b_make_models_band_only.html)). The procedure is the production model's, step for step; only the candidate pool differs. Every selection decision uses out-of-fold CV only.
+
+1. **Candidate pool (17 features).** The pool contains the seven harmonized bands, nine curated spectral indices, and the LaSRC flag.
+2. **Correlation pruning.** Within each cluster of features with |r| > 0.95, only the feature most correlated with SDD is kept. This step reduces the pool to 13 features.
+3. **Gap-aware tuning.** A 25-trial random search is run. Among trials whose mean validation RMSE is within 2% of the best, the trial with the smallest train–validation gap is chosen.
+4. **Backward elimination with shadow decoys.** At each step, the weakest real feature is dropped if its permutation importance does not beat the best row-shuffled shadow copy. Elimination stops when CV RMSE degrades more than 0.5% from the best.
+5. **Final gap-aware tuning.** A 40-trial search is run on the selected feature set.
+6. **Final training.** Four fold models are trained, each with early stopping (5,000 rounds maximum, patience 250) against its own validation fold.
+
+Each final fold model keeps only the boosting rounds up to its best validation score, so every booster is saved and applied at its early-stopping point. The models are trained unweighted. Every seed converged on the shallowest trees in the search space:
+
+| Hyperparameter | Search space | Selected across seeds |
+|---|---|---|
+| `max_depth` | 2, 3, 4 | 2 (all 10 seeds) |
+| `eta` | 0.01, 0.03, 0.05 | 0.01 (6 seeds), 0.03 (1), 0.05 (3) |
+| `subsample` | 0.6, 0.7, 0.8 | 0.6 (all 10 seeds) |
+| `colsample_bytree` | 0.4, 0.5, 0.7 | 0.4–0.7 |
+| `min_child_weight` | 3, 5, 7, 10 | 3–10 |
+| `reg_alpha` | 0, 0.1, 1, 5 | 0–5 |
+| `reg_lambda` | 1, 5, 10, 20 | 1–20 |
+
+The exact values for each seed are in `seed*/final_tune_xgboost.json`.
+
+## Features
+
+Each seed keeps 12 or 13 features. Eleven features were kept by every seed (the *unanimous core*). The table shows how many of the 10 seeds kept each feature. Features dropped by correlation pruning (red, blue, and SWIR2 bands; GR ratio) are not shown.
+
+| Feature | Seeds | Definition |
+|---|---|---|
+| `green_corr7`, `nir_corr7`, `temp_corr7` | 10 | Median surface reflectance (green, NIR) and surface temperature, harmonized to Landsat 7 |
+| `swir1_corr7` | 9 | SWIR1 surface reflectance, harmonized to Landsat 7 |
+| `BR`, `BG`, `NR` | 10 | Blue/red, blue/green, and NIR/red band ratios |
+| `fai`, `NDSSI`, `NDWI`, `MNDWI` | 10 | Floating Algae Index, NDSSI ((blue − NIR)/(blue + NIR)), NDWI (McFeeters 1996), and MNDWI (Xu 2006) |
+| `NDVI` | 9 | Normalized Difference Vegetation Index |
+| `atm_corr_LaSRC` | 10 | 1 for Landsat 8/9 (LaSRC atmospheric correction), 0 for Landsat 4/5/7 (LEDAPS) |
+
+XGBoost handles missing values natively, and band ratios that divide by zero are set to missing.
+
+**Attribution.** Ensemble mean |SHAP| on the holdout, computed over the unanimous core ([step 05b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/05b_evaluate_ensemble_band_only.html)). The top features are `green_corr7` (0.53 m), `BG` (0.49 m), `MNDWI` (0.25 m), `BR` (0.24 m), `fai` (0.21 m), and `NR` (0.11 m).
+
+## Evaluation
+
+### Holdout
+
+Predictions are averaged to one per site-date before scoring (1,833 site-dates from 2,206 matchups).
+
+| Metric | Value |
+|---|---|
+| RMSE | 1.356 m |
+| MAE | 1.002 m |
+| Bias (predicted − observed) | +0.082 m |
+| R² | 0.565 |
+| MAPE | 43.4% |
+| sMAPE | 33.6% |
+
+Error grows with water clarity. Below 4 m, the model runs high by about 0.4–0.6 m. From 4 to 6 m it runs slightly low. Above 6 m, predictions are compressed toward the regional mean:
+
+| Observed SDD | n | RMSE (m) | Bias (m) |
+|---|---|---|---|
+| 0–2 m | 616 | 1.10 | +0.57 |
+| 2–4 m | 671 | 1.15 | +0.39 |
+| 4–6 m | 385 | 1.24 | −0.24 |
+| 6–10 m | 148 | 2.54 | −2.18 |
+| > 10 m | 13 | 3.86 | −3.61 |
+
+### Robustness
+
+- **Choice of holdout.** Holdout RMSE depends on which basins are held out. The same 10 seed configurations were retrained against 16 different holdout draws ([step 06b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/06b_test_set_sensitivity_band_only.html)). Holdout RMSE across those draws ranged from 1.05 to 2.19 m (mean 1.58 m, SD 0.31 m). The fixed holdout sits at the 19th percentile of that range, so 1.36 m is on the favorable side of what to expect for a new set of basins. Most of the spread comes from how much of Lake Powell falls in the holdout (r = 0.69).
+- **Seed-to-seed spread.** For the typical holdout prediction, the per-point standard deviation across the 10 seeds is 0.09 m, and pairwise correlation between seeds is 0.998, so the members agree closely.
+- **CV vs. holdout.** Mean out-of-fold CV RMSE across seeds is 1.58 m (range 1.56–1.59 m), matching the mean of the holdout draws above.
+
+### Superseded matchups
+
+An SDD sample often has more than one image within ±5 days. Training kept only the closest image, so the other images were never used in training (at CV-pool sites they share SDD samples with training matchups). Of 2,811 such matchups, 2,728 pass every applicability check. On those, RMSE is 1.37 m (bias −0.01 m, R² 0.63). At holdout sites only, RMSE is 1.44 m (n = 584, R² 0.58) ([step 07b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07b_regional_application_band_only.html)).
+
+## Applicability checks
+
+The checks below say whether an observation falls inside the conditions the model was trained on. A failed check does not mean the estimate is wrong: it means the estimate is an extrapolation beyond the training data, where performance may be poor. The counts and performance figures in this card are for estimates that pass all of the checks that [step 07b](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07b_regional_application_band_only.html) applies:
+
+1. The scene passes the same siteSR QA as the training data.
+2. The site is inside the training region: the HUC4 basins that overlap the six-state region by at least half.
+3. The Landsat mission is one represented in training (Landsat 4, 5, 7, 8, or 9).
+4. The day of year is between 70 and 320, the central 98% of training matchups.
+5. Every model input is available.
+6. Every input falls within the training range.
+7. The observation is inside the area of applicability (AOA; Meyer & Pebesma 2021). The dissimilarity index (DI) is computed in standardized feature space over the unanimous core, with each feature weighted by its ensemble mean |SHAP|. The threshold is DI ≤ 0.244, the upper whisker of the training pool's cross-fold nearest-neighbor DI.
+8. The estimate is no shallower than the training minimum (0.1 m).
+
+Across the region, 90% of QA-passing location-days pass every check.
+
+Checks 2–8 can be run on new data without the training data. `check_applicability()` in [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) applies them cumulatively and returns a pass/fail column for each check. It also returns the DI of every row with all AOA features present and names the inputs outside their training range (`out_of_range`), so users can see how far outside the training data an observation is and set their own cutoff; an `aoa_threshold` argument overrides the default threshold. It reads three files that step 07b writes to `applicability/`:
+
+- `aoa_parameters.json` contains the AOA threshold and the mean pairwise training distance (`d_bar`). It also has each AOA feature's standardization center, scale, and |SHAP| weight; the training minimum and maximum of every model input; the seasonal window; the training missions; and the training minimum SDD.
+- `aoa_reference.csv` contains the 8,937 CV-pool matchups, already standardized and weighted. A new observation's DI is its distance to the nearest row, divided by `d_bar`.
+
+The DI threshold is specific to this model's feature space and weights, so it is not comparable to the production model's threshold.
+
+- `training_region.geojson` contains the training region footprint, dissolved and simplified to 30 m.
+
+Check 1, scene QA, has to be applied upstream when the reflectance data are prepared, with the functions in [`regional_clarity/R/siteSR_qa.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/siteSR_qa.R).
+
+## Limitations
+
+- **Clear-water compression.** Above about 6 m SDD, water-leaving reflectance is weak relative to the noise floor of atmospheric correction. Like other Landsat clarity models, this model regresses toward the mean in that range, with a bias of about −2.2 m at 6–10 m and about −3.6 m above 10 m. Trends in very clear lakes will be damped.
+- **Sparsely sampled, distinctive waterbodies.** Lake Powell is a very large, deep reservoir whose clarity varies widely between years. The deep, forested-catchment lakes of the Kootenai–Pend Oreille–Spokane basin (HUC4 1701), such as Flathead Lake and Lake Pend Oreille, sit in sparse tails of the training distribution. These two groups account for a large share of the clearest observations and of the error. The errors reflect real physical regimes, not bad data.
+- **Shallow, turbid water.** Below 2 m SDD, predictions are biased high by about 0.6 m.
+- **Optical information only.** The model sees each observation's spectra and nothing about its catchment or recent weather, so waterbodies with similar spectra but different settings receive similar estimates.
+- **Point estimates only.** The ensemble spread (about 0.09 m) reflects model variance, not total predictive uncertainty. Typical error is about 1.4 m, and up to about 2.2 m for unfavorable sets of basins.
+- **Sensor balance.** Landsat 8/9 make up 15% of training matchups. Landsat 4 contributes only 48 matchups.
+
+## Related model
+
+The [production model](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat) was built from the same data, holdout, CV folds, and procedure, with antecedent gridMET weather, LakeCat catchment characteristics, elevation, and a shoreline flag added to the candidate pool. Because each seed's folds are identical between the two models, every comparison below is paired.
+
+| | Production | Band-only (this model) |
+|---|---|---|
+| Inputs | Bands, indices, LaSRC flag, catchment, shoreline flag, antecedent weather | Bands, indices, LaSRC flag |
+| External data needed at inference | LakeCat (EPA StreamCat), elevation tiles, gridMET | None |
+| Features per seed | 26–33 | 12–13 |
+| Holdout RMSE / MAE | 1.257 / 0.941 m | 1.356 / 1.002 m |
+| Holdout bias / R² | +0.152 m / 0.627 | +0.082 m / 0.565 |
+| Holdout RMSE across 16 draws, mean (range) | 1.46 (1.01–1.99) m | 1.58 (1.05–2.19) m |
+| Superseded matchups passing all checks, RMSE | 1.19 m (n = 2,715) | 1.37 m (n = 2,728) |
+| Location-days passing all checks (step 07 / 07b) | 662,191 at 1,796 locations | 670,780 at 1,821 locations |
+
+The production model has the lower holdout RMSE on all 10 seeds and on all 16 holdout draws, by 0.03–0.26 m. Neither model has consistently smaller bias: across the 16 draws, the production model's absolute bias is the larger of the two on 7. Where both produce an estimate for the same location-day, the estimates correlate at r = 0.96, with a mean difference of −0.02 m and a standard deviation of 0.52 m.
+
+## References
+
+- Meyer, H., & Pebesma, E. (2021). Predicting into unknown space? Estimating the area of applicability of spatial prediction models. *Methods in Ecology and Evolution*, 12(9), 1620–1633.
+- McFeeters, S. K. (1996). The use of the Normalized Difference Water Index (NDWI) in the delineation of open water features. *International Journal of Remote Sensing*, 17(7), 1425–1432.
+- Xu, H. (2006). Modification of normalised difference water index (NDWI) to enhance open water features in remotely sensed imagery. *International Journal of Remote Sensing*, 27(14), 3025–3033.
+
+## Citation
+
+Please cite the model by its Zenodo DOI, and cite the data products it was trained on.
+
+> Steele, B.G. (YYYY). *Intermountain West Regional Clarity Remote Sensing Model* (vX.Y.Z) [Software]. Zenodo. <https://doi.org/10.5281/zenodo.XXXXXXX>
+
+```bibtex
+@software{steele_regional_clarity_rs_model,
+  author    = {Steele, B.G.},
+  title     = {Intermountain West Regional Clarity Remote Sensing Model},
+  version   = {vX.Y.Z},
+  year      = {YYYY},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.XXXXXXX},
+  url       = {https://github.com/rossyndicate/regional-clarity-RS-model},
+  note      = {Band-only ensemble v3 (seeds 601--610)}
+}
+```
+
+The DOI above is the Zenodo concept DOI, which always resolves to the latest release. Zenodo also assigns a DOI to each release; cite that one to pin the exact version.
+
+**Data products** (recommended citations from EDI):
+
+- De La Torre, J., B.G. Steele, M.R. Brousil, M.F. Meyer, K. Willi, and M.R. Ross. 2025. AquaMatch Secchi Disk Depth Data from Water Quality Portal: ~1970-2024 ver 1. Environmental Data Initiative. <https://doi.org/10.6073/pasta/542a305e8484ae5abc33881bd7761308>
+- Steele, B.G., M.R. Brousil, K.R. Willi, M.F. Meyer, and M.R. Ross. 2026. SiteSR: AquaMatch Landsat Collection 2 surface reflectance and surface temperature datasets for remote-sensing visible Water Quality Portal and National Water Information System sites in the United States and Territories, 1983-2024 ver 1. Environmental Data Initiative. <https://doi.org/10.6073/pasta/f85622d6d32ef7fe6cff8d63c3b947c9>
+- Steele, B.G., M.R. Brousil, K.R. Willi, M.F. Meyer, and M.R. Ross. 2026. lakeSR: AquaMatch Landsat Collection 2 surface reflectance and surface temperature datasets for centrally-located points of water bodies greater than 1 hectare in the United States and territories, 1983-2024 ver 1. Environmental Data Initiative. <https://doi.org/10.6073/pasta/941f3cb046f5e7fbe04d5811989ed810>

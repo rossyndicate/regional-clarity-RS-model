@@ -30,6 +30,12 @@ regional_clarity/xg_models/hypertune/
 # (SHAP ranking, per-seed feature table, applicability-check reference)
 !regional_clarity/xg_models/v3_production/*.csv
 !regional_clarity/xg_models/v3_production/applicability/*.csv
+!regional_clarity/xg_models/v3_band_only/*.csv
+!regional_clarity/xg_models/v3_band_only/applicability/*.csv
+
+# ...and the holdout-sweep figures from 06 and 06b
+!regional_clarity/xg_models/test_set_sensitivity/*.png
+!regional_clarity/xg_models/test_set_sensitivity_band_only/*.png
 
 # rendered Quarto site (built and deployed by .github/workflows/publish.yml)
 /_site/

@@ -1,0 +1,18 @@
+feature,category,correlation_pruning,seed601,seed602,seed603,seed604,seed605,seed606,seed607,seed608,seed609,seed610,n_seeds_selected,precedent
+atm_corr_LaSRC,sensor/processing flag,survived,1,1,1,1,1,1,1,1,1,1,10,"processing-stream indicator (LaSRC vs. LEDAPS atmospheric correction, coded from mission); not a literature-derived index"
+red_corr7,optical band,dropped (absorbed into green_corr7),,,,,,,,,,,,raw Landsat SR band
+green_corr7,optical band,survived,1,1,1,1,1,1,1,1,1,1,10,raw Landsat SR band
+blue_corr7,optical band,dropped (absorbed into green_corr7),,,,,,,,,,,,raw Landsat SR band
+nir_corr7,optical band,survived,1,1,1,1,1,1,1,1,1,1,10,raw Landsat SR band
+swir1_corr7,optical band,survived,0,1,1,1,1,1,1,1,1,1,9,raw Landsat SR band
+swir2_corr7,optical band,dropped (absorbed into swir1_corr7),,,,,,,,,,,,raw Landsat SR band
+temp_corr7,optical band (surface temp),survived,1,1,1,1,1,1,1,1,1,1,10,raw Landsat surface-temperature band
+BR,spectral index (ratio),survived,1,1,1,1,1,1,1,1,1,1,10,"[NEEDS CITATION] blue:red ratio, per features.py docstring ""Kloiber et al.'s canonical Landsat Secchi-depth ratio"" (MN/WI statewide clarity mapping programs) — please confirm exact citation (likely Kloiber, Brezonik & Bauer 2002, Remote Sensing of Environment)"
+BG,spectral index (ratio),survived,1,1,1,1,1,1,1,1,1,1,10,"[NEEDS CITATION] blue:green ratio, per features.py docstring ""classic ocean-color chlorophyll-a ratio"" — please confirm exact source paper"
+NR,spectral index (ratio),survived,1,1,1,1,1,1,1,1,1,1,10,"[NEEDS CITATION] nir:red ratio, per features.py docstring ""established chlorophyll-a ratio for turbid inland waters"" — please confirm exact source paper"
+GR,spectral index (ratio),dropped (absorbed into BR),,,,,,,,,,,,"[NEEDS CITATION] green:red ratio — per features.py docstring, same chlorophyll-absorption-contrast logic as BG/NR, adjacent-band pairing; dropped in correlation pruning (absorbed into BR)"
+fai,spectral index,survived,1,1,1,1,1,1,1,1,1,1,10,"[NEEDS CITATION] Floating Algae Index — likely Hu (2009), Remote Sensing of Environment 113(10):2118-2129; please confirm"
+NDVI,spectral index,survived,1,1,1,0,1,1,1,1,1,1,9,"[NEEDS CITATION] Normalized Difference Vegetation Index — likely Rouse et al. (1974), NASA SP-351; please confirm"
+NDSSI,spectral index,survived,1,1,1,1,1,1,1,1,1,1,10,[NEEDS CITATION] Normalized Difference Suspended Sediment Index — no confident source identified; please supply
+NDWI,spectral index,survived,1,1,1,1,1,1,1,1,1,1,10,"McFeeters (1996), Int. J. Remote Sensing 17(7):1425-1432"
+MNDWI,spectral index,survived,1,1,1,1,1,1,1,1,1,1,10,"Xu (2006), Int. J. Remote Sensing 27(14):3025-3033"

@@ -37,6 +37,10 @@ library(tigris)
 library(hydrogeofetch)
 library(tidyverse)
 
+# observation QA (site geometry, pixel/scene QA, band RANSAC), shared with end
+# users applying the model to their own data
+source("regional_clarity/R/siteSR_qa.R")
+
 aquamatch_raw_data_dir <- "regional_clarity/aquamatch_files/downloads"
 filtered_aquamatch_dir <- "regional_clarity/aquamatch_files"
 ```
@@ -368,7 +372,7 @@ map(.x = high_flag_sites$MonitoringLocationIdentifier,
       ggplot(., aes(x = ActivityStartDate,
                     y = harmonized_value,
                     color = is_inlier)) +
-      geom_point() +
+      geom_point(size = 1.875) +
       labs(title = .x))
 ```
 
@@ -409,7 +413,7 @@ map(.x = high_flag_sites$MonitoringLocationIdentifier,
       ggplot(., aes(x = ActivityStartDate,
                     y = harmonized_value,
                     color = is_inlier)) +
-      geom_point() +
+      geom_point(size = 1.875) +
       labs(title = .x))
 ```
 
@@ -467,7 +471,7 @@ regional HUC4 footprint. Each site is tagged with its `huc4`.
 sites_geom_qa <- read_csv(file.path(aquamatch_raw_data_dir, "siteSR_collated_WQP_NWIS_sites_with_NHD_info_2025-06-04.csv"),
                   show_col_types = FALSE) %>%
   # make sure the point extent only touches one waterbody
-  filter(number_int_wb == 1) %>%
+  qa_sites() %>%
   select(siteSR_id, wb_nhd_id, wb_gnis_name, wb_areasqkm,
          flag_wb, flag_optical_shoreline,
          flag_thermal_TM_shoreline, flag_thermal_ETM_shoreline,
@@ -586,7 +590,9 @@ within our 6-state region's HUC4 footprint (see "Regional AOI" at the top of
 this script) - this is the precise regional scoping that used to happen only
 at the very end of `02a_make_matches.Rmd`, after matching.
 - **Metadata QA**: `pCount_dswe1/pCount_dswe_gt0 > 0.5`, `pCount_dswe1 > 8`,
-`prop_clouds == 0` pretty generous filters to remove possbile contamination
+`prop_clouds == 0` pretty generous filters to remove possbile contamination,
+plus the siteSR temperature flags (`flag_temp_min == 0`, `flag_temp_max == 0`:
+median surface temperature below freezing or above 40 °C)
 - **Scene-level cloud QA**: `sat_id` is further restricted to scenes in
 `scene_metadata` with
 `CLOUD_COVER < 20`, catching a partly-cloudy scene that could have aerosol impacts
@@ -603,7 +609,8 @@ already applied once in `00_download_AquaMatch_data.Rmd` via
 (`*_corr_7`) straight from its output (`siteSR_DSWE1_LS7corr.parquet`)
 rather than recomputing them here.
 
-The filter itself (`ransac_site_multiband()`) is the same per-site,
+The filter itself (`ransac_site_multiband()`, defined with the rest of the
+observation QA in `R/siteSR_qa.R`) is the same per-site,
 random-subsample RANSAC-like approach as `ransac_site()` above, just fitting
 all seven corrected channels (six reflectance bands plus surface
 temperature) per iteration instead of one, standardized by each channel's
@@ -625,120 +632,7 @@ siteSR_regional_filtered_path <- file.path(filtered_aquamatch_dir, "siteSR_DSWE1
 # so later figures render on every knit without re-running the RANSAC fit
 siteSR_regional_corr_diag_path <- file.path(filtered_aquamatch_dir, "siteSR_DSWE1_regional_band_ransac_diagnostics.parquet")
 
-# store the ransac funciton
-#
-# Majority-vote across iterations (vote_frac >= cutoff), the same design as
-# ransac_site() above - not winner-take-all (picking whichever single random
-# iteration produced the most inliers), which this function used until it
-# was redesigned to match: winner-take-all is far more sensitive to one
-# lucky/unlucky random draw, and with only a 5-day match window and
-# Landsat's sparse revisit, aggressively flagging scenes on that kind of
-# noisy basis can zero out the *only* available candidate image for a field
-# sample rather than just degrading match quality.
-ransac_site_multiband <- function(date, band_mat,
-                                  n_iter = 150,
-                                  n_mad = 2.5,
-                                  # per-band sensor-noise floor
-                                  min_diff = c(red_corr_7 = 0.01, green_corr_7 = 0.01,
-                                               blue_corr_7 = 0.01, nir_corr_7 = 0.01,
-                                               swir1_corr_7 = 0.01, swir2_corr_7 = 0.01,
-                                               surfacetemp_corr_7 = 1),
-                                  min_sample = 10,
-                                  vote_frac_cutoff = 0.5) {
-  n <- nrow(band_mat)
-  nb <- ncol(band_mat)
-  if (n < min_sample + 1) return(rep(NA, n))  # too few points to run ransac
-
-  # match by name rather than assuming column order lines up with min_diff
-  min_diff_b <- min_diff[colnames(band_mat)]
-
-  t <- as.numeric(date)
-
-  # fixed per-band residual scale from a single all-data fit (MAD is robust
-  # up to ~50% contamination, well above what we expect here) - reused for
-  # every candidate subsample below instead of recomputed per iteration
-  band_scale <- vapply(seq_len(nb), function(b) {
-    y <- band_mat[, b]
-    cf <- ols_fit(t, y)
-    pred <- cf["intercept"] + cf["slope"] * t
-    resid <- y - pred
-    s <- mad(resid, na.rm = TRUE)
-    if (is.na(s) || s == 0) s <- sd(resid, na.rm = TRUE)
-    s
-  }, numeric(1))
-
-  # tally, per point, how many valid iterations called it an inlier
-  inlier_votes <- rep(0L, n)
-  n_valid_iter <- 0L
-
-  for (i in 1:n_iter) {
-    idx <- sample(n, min_sample)
-    if (length(unique(t[idx])) < 2) next  # avoid degenerate fit (same date)
-
-    # fit each band vs time on the *same* subsample, standardize each band's
-    # residuals by its fixed scale, then combine - keeps one band's scale
-    # from dominating and keeps the threshold comparable across candidate
-    # lines of very different quality
-    z <- matrix(NA_real_, nrow = n, ncol = nb)
-    for (b in seq_len(nb)) {
-      y <- band_mat[, b]
-      if (length(unique(y[idx])) < 2 || is.na(band_scale[b]) || band_scale[b] == 0) next
-
-      cf <- ols_fit(t[idx], y[idx])
-      if (anyNA(cf)) next
-      pred <- cf["intercept"] + cf["slope"] * t
-      resid <- y - pred
-      z[, b] <- abs(resid) / band_scale[b]
-      # a raw difference this small is within sensor noise for this band -
-      # never let it count as outlier evidence, regardless of how tight
-      # band_scale is
-      z[abs(resid) < min_diff_b[b], b] <- 0
-    }
-
-    combined_z <- rowMeans(z, na.rm = TRUE)
-    inliers <- !is.na(combined_z) & combined_z < n_mad
-
-    inlier_votes <- inlier_votes + as.integer(inliers)
-    n_valid_iter <- n_valid_iter + 1L
-  }
-
-  # no iteration ever produced a usable fit - we haven't determined
-  # anything about this site, so say so rather than leaving every point
-  # flagged by the rep(0L, n) initialization
-  if (n_valid_iter == 0) return(rep(NA, n))
-
-  # a point is an inlier if at least vote_frac_cutoff of the valid
-  # iterations agreed
-  best_inliers <- (inlier_votes / n_valid_iter) >= vote_frac_cutoff
-
-  # a flagged point can't be implausible for this site if every one of its
-  # band values falls within the range other accepted (inlier) points
-  # already span for that band - mirrors the same rescue in ransac_site()
-  if (any(best_inliers)) {
-    in_range <- vapply(seq_len(nb), function(b) {
-      y <- band_mat[, b]
-      accepted <- y[best_inliers]
-      if (length(accepted) == 0 || all(is.na(accepted))) return(rep(TRUE, n))
-      rng <- range(accepted, na.rm = TRUE)
-      y >= rng[1] & y <= rng[2]
-    }, logical(n))
-    best_inliers <- best_inliers | apply(in_range, 1, all)
-  }
-
-  best_inliers
-}
-
-# define closed-form OLS slope/intercept for y ~ t
-ols_fit <- function(t, y) {
-  ok <- is.finite(t) & is.finite(y)
-  if (sum(ok) < 2 || length(unique(t[ok])) < 2) {
-    return(c(intercept = NA_real_, slope = NA_real_))
-  }
-  tt <- t[ok]; yy <- y[ok]
-  tm <- mean(tt); ym <- mean(yy)
-  slope <- sum((tt - tm) * (yy - ym)) / sum((tt - tm)^2)
-  c(intercept = ym - slope * tm, slope = slope)
-}
+# ransac_site_multiband() is defined in R/siteSR_qa.R (sourced in setup)
 
 # corrected band columns, already computed in 00_download_AquaMatch_data.Rmd
 band_cols <- c("red_corr_7", "green_corr_7", "blue_corr_7",
@@ -789,17 +683,9 @@ row_log <- log_step(row_log, "siteSR", "1_geometry_and_HUC4_scoped",
                       collect() %>% 
                       pull(n))
 
+# pixel, temperature, and scene QA (qa_siteSR_rows() in R/siteSR_qa.R)
 siteSR_metaqa <- siteSR_geom_huc4 %>%
-  filter(pCount_dswe1 / pCount_dswe_gt0 > 0.5,
-         pCount_dswe1 > 8,
-         # only rows with no clouds in the buffer area
-         prop_clouds == 0,
-         # no rows with median temp below freezing
-         flag_temp_min == 0,
-         # or above 40deg
-         flag_temp_max == 0,
-         # filter for scenes with < 20% cloud cover
-         sat_id %in% scene_metadata$sat_id)
+  qa_siteSR_rows(scene_metadata)
 row_log <- log_step(row_log, "siteSR", "2_metadata_scene_QA",
                     n_rows = siteSR_metaqa %>% 
                       summarize(n = n()) %>% 
@@ -945,7 +831,7 @@ map(.x = spotcheck_sites,
                      values_to = "band_val") %>%
         ggplot(.,
                aes(x = date, y = band_val, color = is_band_inlier)) +
-        geom_point() +
+        geom_point(size = 1.875) +
         facet_grid(band ~ siteSR_id, scales = "free_y") +
         scale_color_manual(values = c(`TRUE` = "grey40", `FALSE` = "red")) +
         theme_bw()
@@ -1066,7 +952,7 @@ walk(decile10_sites, function(site) {
     siteSR_band_long %>%
       filter(siteSR_id == site) %>%
       ggplot(aes(x = date, y = band_val, color = is_band_inlier)) +
-      geom_point() +
+      geom_point(size = 1.875) +
       geom_hline(data = band_p90_df, aes(yintercept = p90),
                  linetype = "dashed") +
       facet_wrap(~ band, scales = "free_y", ncol = 2) +

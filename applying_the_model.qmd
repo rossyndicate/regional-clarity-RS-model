@@ -1,0 +1,297 @@
+---
+title: "Applying the model"
+subtitle: "Accessing the SDD ensembles and estimating Secchi disc depth for new Landsat observations"
+---
+
+This page describes how to obtain the SDD ensembles and apply them to new data with the helper functions in the source repository. Two models are published, and the same helpers apply both:
+
+| Model | Inputs | Model card |
+|---|---|---|
+| Production | Landsat bands and indices, catchment characteristics, shoreline flag, antecedent weather | [Production](model_card.qmd) |
+| Band-only | Landsat bands and indices only | [Band-only](model_card_band_only.qmd) |
+
+The model cards cover what each model is, how it performs, how the two compare, and where they should not be used; read the card for the model you use before applying it. [Step 07](regional_clarity/07_regional_application.Rmd) (production) and [step 07b](regional_clarity/07b_regional_application_band_only.Rmd) (band-only) are complete worked applications across the region that use the same functions described here.
+
+Applying the model takes four steps:
+
+1. **Obtain QA'd Landsat observations** at your sites, harmonized to Landsat 7 (R, `AquaMatchr` and `siteSR_qa.R`).
+2. **Prepare model inputs**: spectral indices, plus site characteristics, antecedent weather, and feature coarsening for the production model (R, `prepare_model_inputs.R`).
+3. **Predict SDD** with the 40-member ensemble (Python `apply_model.py`, or R).
+4. **Flag the estimates** with the applicability checks (Python `apply_model.py`, or R).
+
+Steps 1 and 2 run in R because they share their code with the training pipeline. Building inputs with the same functions that built the training data guarantees that a feature means the same thing at application time as it did in training. Steps 3 and 4 need only the model folder, so they run without the training data.
+
+## Accessing the models
+
+Each model is published on the Hugging Face Hub, and the same folders are tracked in the source repository:
+
+| Model | Hugging Face Hub | Repository folder |
+|---|---|---|
+| Production | [`bgsteele/intermountain-west-regional-clarity-sdd-landsat`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat) | [`regional_clarity/xg_models/v3_production/`](https://github.com/rossyndicate/regional-clarity-RS-model/tree/main/regional_clarity/xg_models/v3_production) |
+| Band-only | [`bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only`](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only) | [`regional_clarity/xg_models/v3_band_only/`](https://github.com/rossyndicate/regional-clarity-RS-model/tree/main/regional_clarity/xg_models/v3_band_only) |
+
+Either copy works with the helper functions; pass its path as `model_dir`. The examples below use the production model; for the band-only model, substitute its repository ID or folder.
+
+The Hub copy holds only model artifacts. The helper code lives in the source repository, so clone the repository in either case:
+
+```bash
+git clone https://github.com/rossyndicate/regional-clarity-RS-model.git
+```
+
+To download the model from the Hub instead of using the repository copy:
+
+```python
+from huggingface_hub import snapshot_download
+
+model_dir = snapshot_download("bgsteele/intermountain-west-regional-clarity-sdd-landsat")
+```
+
+or, from the command line, `hf download bgsteele/intermountain-west-regional-clarity-sdd-landsat --local-dir v3_production`.
+
+### What a model folder contains
+
+Both model folders have the same layout:
+
+| Path | Contents |
+|---|---|
+| `seed601/` … `seed610/` | One folder per ensemble seed. |
+| `seed*/xgboost_fold{1-4}.json` | The four fitted boosters for that seed, in XGBoost JSON format. Each contains only the trees up to its early-stopping iteration. |
+| `seed*/backward_elim_summary.json` | That seed's selected features, in model order, under `final_features`. |
+| `seed*/final_tune_xgboost.json` | That seed's tuned hyperparameters (also lists `features`). |
+| `seed*/final_eval_summary.json` | That seed's CV and holdout metrics. |
+| `ensemble_mean_abs_shap.csv` | Ensemble mean \|SHAP\| per feature; also the weights for the AOA check. |
+| `supplemental_feature_table.csv` | Every candidate feature, its pruning outcome, and which seeds kept it. |
+| `applicability/aoa_parameters.json` | AOA threshold and scaling, the training range of every model input, the seasonal window, training missions, and the minimum training SDD. |
+| `applicability/aoa_reference.csv` | The training observations in AOA space, for the nearest-neighbor dissimilarity index. |
+| `applicability/training_region.geojson` | The training region footprint (HUC4 basins), for the region check. |
+
+Each of the 40 boosters is fit on its own seed's feature set, so seeds differ in which inputs they use. The full input set is the union across seeds, listed in each model card's Features table ([production](model_card.qmd#features), [band-only](model_card_band_only.qmd#features)). Every row you predict on needs every input in that union.
+
+## Environment setup
+
+**R** (steps 1–2, and optionally 3–4): `tidyverse`, `sf`, `arrow`, `elevatr`, `StreamCatTools`, `climateR`, `data.table`, and `parallel`; plus [`AquaMatchr`](https://github.com/AquaSat/AquaMatchr) (`remotes::install_github("AquaSat/AquaMatchr")`) for data access. `prepare_model_inputs.R` loads all of these when sourced, so they must be installed even when preparing band-only inputs. Predicting and flagging in R also needs `xgboost`, `jsonlite`, and `RANN`.
+
+**Python** (steps 3–4): build the environment described in the repository README's [Python environment](https://github.com/rossyndicate/regional-clarity-RS-model#python-environment) section from `requirements-lock.txt`. `apply_model.py` itself needs only `numpy`, `pandas`, `scipy`, `shapely`, and `xgboost`; the environment also includes `huggingface_hub` for downloading the model from the Hub.
+
+::: {.callout-warning}
+## macOS: set the OpenMP variables first
+Export `KMP_DUPLICATE_LIB_OK=TRUE` and `OMP_NUM_THREADS` (e.g. 4) **before** importing XGBoost. Without them, XGBoost can load a competing OpenMP runtime and oversubscribe the CPU.
+:::
+
+## Step 1: Obtain QA'd Landsat observations
+
+The model was trained on [AquaMatch siteSR](https://doi.org/10.6073/pasta/f85622d6d32ef7fe6cff8d63c3b947c9) data: Landsat Collection 2 surface reflectance and temperature summarized at water-quality monitoring sites, harmonized across missions to Landsat 7. New observations have to come from the same product and pass the same QA, otherwise the reflectance values are not comparable to the training data. [Step 00](regional_clarity/00_download_AquaMatch_data.Rmd) downloads and harmonizes the data with `AquaMatchr`:
+
+```r
+library(AquaMatchr)
+
+# requires an EDI account and API key, stored as EDI_API_key in .Renviron
+EDIutils::login(key = Sys.getenv("EDI_API_key"))
+
+download_siteSR(download_folder = data_dir, version = "newest", algal_mask = FALSE)
+build_sr(which_sr = "siteSR", sr_location = data_dir, algal_mask = FALSE,
+         output_file = file.path(data_dir, "siteSR_DSWE1_full_concatenation.parquet"))
+apply_handoffs(input_path = file.path(data_dir, "siteSR_DSWE1_full_concatenation.parquet"),
+               handoff_path = list.files(data_dir, pattern = "handoff", full.names = TRUE),
+               correction_method = "Gardner_poly", sat_target = "LS7", algal_mask = FALSE,
+               output_file = file.path(data_dir, "siteSR_DSWE1_LS7corr.parquet"))
+download_sceneMetadata(download_folder = data_dir, product = "siteSR")
+```
+
+The handoffs must target Landsat 7 (`sat_target = "LS7"`); the `*_corr_7` bands are what the model was trained on.
+
+### Required columns
+
+These are the columns the QA, input preparation, and applicability checks read. Definitions and units are from the [siteSR metadata on EDI](https://doi.org/10.6073/pasta/f85622d6d32ef7fe6cff8d63c3b947c9), except for the `*_corr_7` columns, which `apply_handoffs()` adds. The site table is `siteSR_collated_WQP_NWIS_sites_with_NHD_info_*.csv`, the observations are the harmonized siteSR parquet, and the scene metadata is `sceneMetadata_Landsat*.csv`.
+
+| Table | Column | Definition | Units | Used for |
+|---|---|---|---|---|
+| sites | `siteSR_id` | Unique siteSR site identifier: the initials of the site's source (`WQP`, `NWIS`) and an integer, e.g. `WQP_27`. | | Joins |
+| sites | `WGS84_Latitude`, `WGS84_Longitude` | Site latitude and longitude, converted to WGS84. | decimal degrees | Region check; elevation and gridMET lookup (production) |
+| sites | `number_int_wb` | Number of NHD waterbodies (lake, pond, or reservoir) the site intersects when buffered by 200 m. | count | QA |
+| sites | `wb_nhd_id` | Waterbody identifier: the NHDPlusV2 COMID when `wb_nhd_source` is `NHDPlusv2`, otherwise the NHD `Permanent_Identifier`. | | LakeCat lookup (production) |
+| sites | `wb_nhd_source` | NHD source of the waterbody: `NHDPlusv2` or `NHDBestRes`. | | Must be `NHDPlusv2` (production) |
+| sites | `flag_wb` | Site position relative to its NHD waterbody: 0 inside the polygon; 1 within 200 m; 2 200–500 m; 3 more than 500 m (not assigned); 4 no waterbody assigned. | code | `shore_flag` (production) |
+| sites | `flag_optical_shoreline` | 1 if the site is within 230 m of the NHD polygon shoreline, 0 otherwise. | code | `shore_flag` (production) |
+| observations | `siteSR_id` | As above. | | Joins |
+| observations | `date` | Calendar date of the Landsat acquisition. | YYYY-MM-DD | Seasonal check; antecedent weather (production) |
+| observations | `mission` | Landsat mission: `LT04`, `LT05`, `LE07`, `LC08`, or `LC09`. | | Mission check; LaSRC flag |
+| observations | `sat_id` | Identifier of the Landsat scene the observation was summarized from. | | Join to scene metadata (QA) |
+| observations | `pCount_dswe1` | Number of pixels in the 200 m site buffer with DSWE = 1 (confident water), after masking clouds, opacity, glint, and unrealistic values. | pixels | QA |
+| observations | `pCount_dswe_gt0` | As `pCount_dswe1`, for pixels with DSWE > 0 (water at any confidence). | pixels | QA |
+| observations | `prop_clouds` | Proportion of pixels in the site buffer masked for cloud. | proportion (0–1) | QA |
+| observations | `flag_temp_min` | Handling of `med_SurfaceTemp` at the 273.15 K minimum: 0 above it, no action; 1 no data (masked upstream); 2 below it, recoded to NA. | code | QA |
+| observations | `flag_temp_max` | Handling of `med_SurfaceTemp` at the 313.15 K maximum: 0 below it, no action; 1 no data (masked upstream); 2 above it, recoded to NA. | code | QA |
+| observations | `red_corr_7`, `green_corr_7`, `blue_corr_7`, `nir_corr_7`, `swir1_corr_7`, `swir2_corr_7` | Median surface reflectance of non-masked pixels in the 200 m site buffer (`med_Red`, `med_Green`, …), harmonized to Landsat 7. | reflectance (unitless) | Model inputs; band-outlier QA |
+| observations | `surfacetemp_corr_7` | Median surface temperature of non-masked pixels in the 200 m site buffer (`med_SurfaceTemp`), harmonized to Landsat 7. | kelvin | Model input; band-outlier QA |
+| scene metadata | `sat_id` | Identifier of the Landsat scene. | | Join to observations |
+| scene metadata | `CLOUD_COVER` | Overall cloud cover of the WRS-2 scene; −1 means it was not calculated. | percent | QA |
+
+Then apply the observation QA the training data passed. [`regional_clarity/R/siteSR_qa.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/siteSR_qa.R) holds the QA functions that [step 01](regional_clarity/01_filter_AquaMatch_Data.Rmd) uses to build the training data:
+
+```r
+source("regional_clarity/R/siteSR_qa.R")
+
+sites <- qa_sites(sites)
+sitesr_rows <- sitesr_rows %>%
+  filter(siteSR_id %in% sites$siteSR_id) %>%
+  qa_siteSR_rows(scene_metadata) %>%
+  filter_band_outliers()
+```
+
+| Function | Keeps |
+|---|---|
+| `qa_sites(sites)` | Sites whose buffer intersects exactly one waterbody (`number_int_wb == 1`). |
+| `qa_siteSR_rows(sitesr_rows, scene_metadata)` | Rows with `pCount_dswe1 / pCount_dswe_gt0 > 0.5`, `pCount_dswe1 > 8`, `prop_clouds == 0`, and no siteSR temperature flag (`flag_temp_min == 0`, `flag_temp_max == 0`, which drops rows whose median surface temperature is missing, below freezing, or above 40 °C), from scenes with `CLOUD_COVER < 20` in the scene metadata (joined on `sat_id`). |
+| `filter_band_outliers(sitesr_rows)` | Rows that are not per-site reflectance outliers under the multiband RANSAC filter (`ransac_site_multiband()`). |
+
+The band-outlier filter fits a trend through each site's record, so run it on each site's full siteSR history, not only on the scenes you want estimates for. A site with 10 or fewer observations cannot be fit and passes unfiltered.
+
+Step 01 also restricts the training data to the HUC4 basins of the six-state region. `siteSR_qa.R` does not repeat that restriction; the region check in step 4 flags observations outside it instead.
+
+This QA is check 1 of the model card's [applicability checks](model_card.qmd#applicability-checks). It cannot be applied after prediction, so it has to be done here.
+
+The output of this step is two tables that the next step takes as input: `sites`, one row per QA-passing site, and `sitesr_rows`, one row per QA-passing observation, each with the columns listed in [Required columns](#required-columns).
+
+For the production model, each site's waterbody must also come from NHDPlusV2 (`wb_nhd_source == "NHDPlusv2"`). LakeCat catchment metrics are keyed on NHDPlusV2 COMIDs, so `prepare_model_inputs()` stops with an error if any site's waterbody is from another source. This is a requirement of the inputs, not part of the QA. The band-only model has no such requirement.
+
+::: {.callout-note}
+## Locations not in siteSR
+siteSR covers Water Quality Portal and NWIS monitoring sites. For other locations, the [siteSR pipeline](https://github.com/AquaSat/AquaMatch_siteSR) can be adapted to extract surface reflectance at a custom set of points, producing data that matches the product the model was trained on. We are also developing a standalone method for custom-location extraction.
+:::
+
+## Step 2: Prepare model inputs (R)
+
+[`regional_clarity/R/prepare_model_inputs.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/prepare_model_inputs.R) turns those two tables into one model-ready row per observation. For most uses, one call does everything:
+
+```r
+source("regional_clarity/R/prepare_model_inputs.R")
+
+model_input <- prepare_model_inputs(sites, sitesr_rows)
+arrow::write_parquet(model_input, "model_input.parquet")
+```
+
+For the production model, `prepare_model_inputs()` fetches elevation (AWS terrain tiles via `elevatr`), LakeCat catchment metrics (EPA StreamCat via `StreamCatTools`), and daily gridMET weather (via `climateR`). It then summarizes antecedent weather, computes spectral indices, coarsens the site features, and joins everything. It needs network access, and the gridMET fetch is the slow part. Its arguments:
+
+- `keep` names extra `sitesr_rows` columns to carry through to the output (for example, your own identifiers).
+- `n_workers` sets the number of parallel gridMET requests (default 8).
+- `site_and_weather = FALSE` prepares inputs for the band-only model. Nothing is fetched, and the output holds only the bands, LaSRC flag, and spectral indices. Of the `sites` table, only `siteSR_id` and the coordinates are used.
+
+Either way, each output row carries its site's `WGS84_Latitude` and `WGS84_Longitude` for the region check in step 4.
+
+```r
+model_input <- prepare_model_inputs(sites, sitesr_rows, site_and_weather = FALSE)
+```
+
+Cells that fail to fetch after one retry produce a warning, and their rows are left with missing weather. Those rows then fail the completeness check in step 4.
+
+### Function reference
+
+The individual steps are exposed as functions so you can cache intermediate results or reuse values you already have. [Step 07](regional_clarity/07_regional_application.Rmd) calls them separately, caching each fetch.
+
+| Function | What it does |
+|---|---|
+| `prepare_model_inputs(sites, sitesr_rows, keep, n_workers, site_and_weather)` | Runs all of the steps below, or only `assemble_model_inputs()` with `site_and_weather = FALSE`. |
+| `fetch_site_characteristics(sites, existing = NULL)` | Elevation, LakeCat catchment area and 2006 land cover, and `shore_flag` per site. Rows of `existing` (same columns) are reused and only the remaining sites are fetched. Stops if any site's waterbody is not from NHDPlusV2. |
+| `gridmet_cells(sites)` | The 1/24° gridMET cell each site falls in. Sites sharing a cell share weather. |
+| `gridmet_cell_ranges(sitesr_rows, site_cells)` | The date range each cell needs: its observation dates plus the 30-day antecedent window. |
+| `fetch_gridmet(cell_ranges, n_workers)` | Daily precipitation, maximum and minimum temperature, and solar radiation per cell, fetched in parallel. Returns `list(weather, failed)`. |
+| `summarize_weather(weather_raw)` | 1-, 3-, 7- and 30-day summaries per cell and date. Each window covers the days strictly *before* the image date. |
+| `add_features(df)` | Spectral ratios and indices, plus coarsening of whichever catchment and land-cover features are present. |
+| `assemble_model_inputs(sitesr_rows, site_char, site_cells, weather_summaries, keep)` | Renames the bands to model names, sets `atm_corr_LaSRC`, joins site characteristics and weather, and calls `add_features()`. Leave `site_char`, or `site_cells` and `weather_summaries`, as `NULL` to skip those joins. |
+
+`add_features()` applies the same feature engineering as the training pipeline, including the fixed catchment-area cap (`CATCHMENT_WINSORIZE_CAP_SQKM`, 617.1 km²). The cap is the training-data 99th percentile and must not be recomputed from new data.
+
+### Building inputs in Python instead
+
+If you assemble site characteristics and weather yourself, [`regional_clarity/python/features.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/features.py) provides the Python originals of the last step: `add_spectral_indices()` and `coarsen_site_features()`. Every other input has to match the definitions in `prepare_model_inputs.R` exactly: column names, units, the NLCD 2006 vintage, the window definitions, and the `shore_flag` rule. Using the R functions is the safer path.
+
+## Step 3: Predict SDD
+
+[`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) loads the ensemble and predicts:
+
+```python
+import sys
+
+import pandas as pd
+
+sys.path.insert(0, "regional_clarity/python")
+from apply_model import load_ensemble, predict_sdd
+
+model_dir = "regional_clarity/xg_models/v3_production"   # or v3_band_only, or a snapshot_download() path
+X = pd.read_parquet("model_input.parquet")
+
+members = load_ensemble(model_dir)          # 40 (features, booster) pairs
+X["pred_sdd"] = predict_sdd(members, X)     # ensemble mean, in metres
+```
+
+| Function | What it does |
+|---|---|
+| `load_ensemble(model_dir)` | Returns the 40 members (10 seeds × 4 folds) as `(features, booster)` pairs, with each seed's feature list read from its `backward_elim_summary.json`. |
+| `predict_sdd(members, X)` | Gives each booster its own seed's features, in order, and returns the mean of the 40 predictions. `X` may carry extra columns. |
+
+Applied to the training repository's holdout, this reproduces each model's published holdout RMSE: 1.2567 m for production and 1.3558 m for band-only (scored once per unique site and date).
+
+### Predicting in R
+
+To stay in R, load each seed's features and boosters and average. This is the prediction step in steps [07](regional_clarity/07_regional_application.Rmd) and [07b](regional_clarity/07b_regional_application_band_only.Rmd), and it gives the same predictions:
+
+```r
+library(xgboost)
+library(jsonlite)
+
+model_dir <- "regional_clarity/xg_models/v3_production"
+
+seed_preds <- sapply(601:610, \(s) {
+  seed_dir <- file.path(model_dir, paste0("seed", s))
+  feats <- fromJSON(file.path(seed_dir, "backward_elim_summary.json"))$final_features
+  X <- as.matrix(model_input[, feats])
+  rowMeans(sapply(1:4, \(fold) predict(xgb.load(file.path(seed_dir, paste0("xgboost_fold", fold, ".json"))), X)))
+})
+model_input$pred_sdd <- rowMeans(seed_preds)
+model_input$pred_seed_sd <- apply(seed_preds, 1, sd)
+```
+
+The spread across seeds (`pred_seed_sd`, typically about 0.12 m for production and 0.09 m for band-only) measures how much the ensemble members disagree. It is not a prediction interval: typical error against in situ SDD is about 1.3 m for production and 1.4 m for band-only.
+
+## Step 4: Flag the estimates
+
+The applicability checks say whether an observation falls inside the conditions the model was trained on. A failed check does not mean the estimate is wrong. It means the estimate is an extrapolation beyond the training data, where tree ensembles can perform poorly. `check_applicability()` runs checks 2–8 from the model card ([production](model_card.qmd#applicability-checks), [band-only](model_card_band_only.qmd#applicability-checks)) using only the model folder's `applicability/` files:
+
+```python
+from apply_model import check_applicability
+
+flags = check_applicability(X, model_dir, pred_sdd=X["pred_sdd"])
+X = X.join(flags)
+in_domain = X[X["pass_all"]]
+```
+
+Always pass the same `model_dir` you predicted with. Each model's training region, training ranges, AOA features, and DI threshold are its own, so flagging one model's estimates with the other's files gives wrong results.
+
+`X` needs `WGS84_Latitude`, `WGS84_Longitude`, `date`, and `mission` columns (`LT04`, `LT05`, `LE07`, `LC08`, or `LC09`) in addition to the model inputs; `prepare_model_inputs()` carries all four through. The checks are cumulative, so each `pass_*` column is true only if the row also passed every earlier check:
+
+| Column | Check |
+|---|---|
+| `pass_region` | Site inside the training region: the HUC4 basins of the six-state region. |
+| `pass_mission` | Landsat mission represented in training. |
+| `pass_season` | Day of year within the training window (70–320). |
+| `pass_complete` | Every model input is present. |
+| `pass_range` | Every model input falls within its training range. |
+| `out_of_range` | The model inputs outside their training range, comma-separated (empty when none). |
+| `di` | Dissimilarity index: weighted, standardized distance to the nearest training observation (Meyer & Pebesma 2021). Returned for every row with all AOA features present, whether or not it passes; missing otherwise. |
+| `pass_aoa` | Inside the area of applicability (`di` at or below the threshold in `aoa_parameters.json`). |
+| `pass_plausible` | Prediction no shallower than the training minimum (0.1 m). Only present when `pred_sdd` is given. |
+| `pass_all` | Passed every check. |
+
+Without `pred_sdd`, `pass_all` stops at the AOA check, so you can flag observations before predicting.
+
+The flags are information for your own decision, not a filter that has to be applied as is. The per-check columns show *why* a row failed, and `di` and `out_of_range` show by how much. A waterbody that falls outside the AOA on every date is beyond what the model has learned, while scattered seasonal failures, or a DI just above the threshold, are minor departures. The default DI threshold is the upper whisker of the training data's own cross-fold DI distribution (`aoa_threshold` in `aoa_parameters.json`: 0.394 for production, 0.244 for band-only). To apply a stricter or looser one, pass it as `check_applicability(..., aoa_threshold=...)`, or compare `di` with your own cutoff directly. Whatever you choose, report how you used the flags alongside the estimates.
+
+For an R implementation of the same checks, see the "Applicability checks" section of [step 07](regional_clarity/07_regional_application.Rmd) or [step 07b](regional_clarity/07b_regional_application_band_only.Rmd). The Python and R versions give identical results.
+
+## Before you use the estimates
+
+- **Check the limitations.** Both models compress clear-water estimates above about 6 m SDD and overestimate below about 2 m. Read the Limitations section of the model card ([production](model_card.qmd#limitations), [band-only](model_card_band_only.qmd#limitations)) before interpreting trends or extremes.
+- **Stay inside the training region.** The models were trained on the HUC4 basins of six states of the intermountain West (CO, ID, MT, NM, UT, WY). The region check flags sites outside them. Passing the other checks does not establish that either model transfers to a different region.
+- **Use the same data product.** Reflectance from a different atmospheric correction, harmonization reference, or extraction method is not interchangeable with siteSR's `*_corr_7` bands, even when the column names match.
+- **Report the version.** Cite the model as described in [How to cite](index.qmd#how-to-cite), including the release you used and which model (production or band-only) produced the estimates.

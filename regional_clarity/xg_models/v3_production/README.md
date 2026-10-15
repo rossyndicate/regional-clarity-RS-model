@@ -42,6 +42,8 @@ model-index:
 
 An ensemble of 40 XGBoost regressors that estimates Secchi disc depth (SDD, in meters) for lakes and reservoirs from Landsat Collection 2 surface reflectance. It also uses antecedent weather and static catchment characteristics. The model covers six states in the intermountain West (Colorado, Idaho, Montana, New Mexico, Utah, and Wyoming) across Landsat 4, 5, 7, 8, and 9, 1984–2023.
 
+A [band-only counterpart](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only), built with the same data and procedure from the Landsat-derived features alone, is published separately. See [Related model](#related-model) for a comparison.
+
 On a fixed holdout of whole HUC8 basins that no ensemble member trained on, the model reaches an RMSE of 1.26 m, an MAE of 0.94 m, and an R² of 0.63. It is most accurate below about 6 m SDD and underestimates very clear water (see [Limitations](#limitations)).
 
 The full workflow, with code and outputs for every step, is published at <https://rossyndicate.github.io/regional-clarity-RS-model/>.
@@ -70,6 +72,7 @@ The full workflow, with code and outputs for every step, is published at <https:
 - Landsat Collection 2 surface reflectance from AquaMatch siteSR, using DSWE1 (high-confidence water) pixels;
 - bands harmonized across sensors to the Landsat 7 reference using the AquaMatch handoff coefficients;
 - the same scene QA as the training data;
+- sites inside the training region (the HUC4 basins of the six-state region);
 - open-water-season scenes only;
 - every feature inside the model's area of applicability.
 
@@ -77,7 +80,7 @@ The [Applicability checks](#applicability-checks) section gives the exact criter
 
 **Out of scope.**
 
-- Waterbodies outside the six-state region. The model has not been evaluated there, and the area-of-applicability check does not account for geographic distance.
+- Waterbodies outside the six-state region. The model has not been evaluated there. The region check flags these sites, since none of the other checks accounts for geographic distance.
 - Ice-season scenes (outside day of year 70–320).
 - Reflectance products other than AquaMatch siteSR with LS7-referenced harmonization, such as un-harmonized surface reflectance, other atmospheric corrections, or other sensors such as Sentinel-2.
 - Regulatory or compliance decisions for a single waterbody on a single date. Individual estimates carry about ±1.3 m of typical error. The model is better suited to patterns aggregated across dates or sites.
@@ -98,6 +101,7 @@ supplemental_feature_table.csv # every candidate feature, its pruning outcome, a
 applicability/
   aoa_parameters.json          # AOA threshold and scaling, training ranges, seasonal window, missions
   aoa_reference.csv            # training observations in AOA space, for the nearest-neighbor DI
+  training_region.geojson      # training region footprint (HUC4 basins), for the region check
 ```
 
 The same folder is tracked in the source repository under [`regional_clarity/xg_models/v3_production/`](https://github.com/rossyndicate/regional-clarity-RS-model/tree/main/regional_clarity/xg_models/v3_production). [Step 05](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/05_evaluate_ensemble.html) writes the SHAP ranking and [step 07](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07_regional_application.html) writes `applicability/`.
@@ -105,7 +109,7 @@ The same folder is tracked in the source repository under [`regional_clarity/xg_
 The code for applying the model lives in the [source repository](https://github.com/rossyndicate/regional-clarity-RS-model), not on the Hub. Applying it takes two steps:
 
 1. **Prepare inputs (R).** [`regional_clarity/R/prepare_model_inputs.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/prepare_model_inputs.R) builds one row per observation from AquaMatch siteSR sites and observations that passed siteSR QA. It fetches elevation, LakeCat catchment metrics, and gridMET antecedent weather, then computes the spectral indices and coarsened site features. Step 07 runs this same code for the regional application.
-2. **Predict and screen (Python).** [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) loads the 40 boosters, gives each one its seed's features in order, and returns the ensemble mean. It then runs the [applicability checks](#applicability-checks) against `applicability/`, so you can screen observations without the training data.
+2. **Predict and flag (Python).** [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) loads the 40 boosters, gives each one its seed's features in order, and returns the ensemble mean. It then runs the [applicability checks](#applicability-checks) against `applicability/`, so you can flag observations without the training data.
 
 ```r
 source("regional_clarity/R/prepare_model_inputs.R")
@@ -125,9 +129,11 @@ from apply_model import load_ensemble, predict_sdd, check_applicability
 model_dir = snapshot_download("bgsteele/intermountain-west-regional-clarity-sdd-landsat")   # or regional_clarity/xg_models/v3_production
 X = pd.read_parquet("model_input.parquet")
 X["pred_sdd"] = predict_sdd(load_ensemble(model_dir), X)   # 40 members
-flags = check_applicability(X, model_dir, pred_sdd=X["pred_sdd"])   # one pass_* column per check, plus di
-usable = X[flags["pass_all"]]
+flags = check_applicability(X, model_dir, pred_sdd=X["pred_sdd"])   # one pass_* column per check, plus di and out_of_range
+in_domain = X[flags["pass_all"]]
 ```
+
+Always flag with the `applicability/` files from the same model folder you predict with: the production and band-only models' training ranges and areas of applicability differ.
 
 To stay in R, follow the prediction and applicability sections of step 07, which give the same results.
 
@@ -252,24 +258,27 @@ An SDD sample often has more than one image within ±5 days. Training kept only 
 
 ## Applicability checks
 
-An estimate should be used only when it passes all of the checks that [step 07](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07_regional_application.html) applies:
+The checks below say whether an observation falls inside the conditions the model was trained on. A failed check does not mean the estimate is wrong: it means the estimate is an extrapolation beyond the training data, where performance may be poor. The counts and performance figures in this card are for estimates that pass all of the checks that [step 07](https://rossyndicate.github.io/regional-clarity-RS-model/regional_clarity/07_regional_application.html) applies:
 
 1. The scene passes the same siteSR QA as the training data.
-2. The Landsat mission is one represented in training (Landsat 4, 5, 7, 8, or 9).
-3. The day of year is between 70 and 320, the central 98% of training matchups.
-4. Every model input is available.
-5. Every input falls within the training range.
-6. The observation is inside the area of applicability (AOA; Meyer & Pebesma 2021). The dissimilarity index (DI) is computed in standardized feature space over the unanimous core, with each feature weighted by its ensemble mean |SHAP|. The threshold is DI ≤ 0.394, the upper whisker of the training pool's cross-fold nearest-neighbor DI.
-7. The estimate is no shallower than the training minimum (0.1 m).
+2. The site is inside the training region: the HUC4 basins that overlap the six-state region by at least half.
+3. The Landsat mission is one represented in training (Landsat 4, 5, 7, 8, or 9).
+4. The day of year is between 70 and 320, the central 98% of training matchups.
+5. Every model input is available.
+6. Every input falls within the training range.
+7. The observation is inside the area of applicability (AOA; Meyer & Pebesma 2021). The dissimilarity index (DI) is computed in standardized feature space over the unanimous core, with each feature weighted by its ensemble mean |SHAP|. The threshold is DI ≤ 0.394, the upper whisker of the training pool's cross-fold nearest-neighbor DI.
+8. The estimate is no shallower than the training minimum (0.1 m).
 
 Across the region, 89% of QA-passing location-days pass every check.
 
-Checks 2–7 can be run on new data without the training data. `check_applicability()` in [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) applies them cumulatively and returns a pass/fail column for each check and the DI. It reads two files that step 07 writes to `applicability/`:
+Checks 2–8 can be run on new data without the training data. `check_applicability()` in [`regional_clarity/python/apply_model.py`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/python/apply_model.py) applies them cumulatively and returns a pass/fail column for each check. It also returns the DI of every row with all AOA features present and names the inputs outside their training range (`out_of_range`), so users can see how far outside the training data an observation is and set their own cutoff; an `aoa_threshold` argument overrides the default threshold. It reads three files that step 07 writes to `applicability/`:
 
 - `aoa_parameters.json` contains the AOA threshold and the mean pairwise training distance (`d_bar`). It also has each AOA feature's standardization center, scale, and |SHAP| weight; the training minimum and maximum of every model input; the seasonal window; the training missions; and the training minimum SDD.
 - `aoa_reference.csv` contains the 8,926 CV-pool matchups with every AOA feature available, already standardized and weighted. A new observation's DI is its distance to the nearest row, divided by `d_bar`.
 
-Check 1, scene QA, has to be applied upstream when the reflectance data are prepared.
+- `training_region.geojson` contains the training region footprint, dissolved and simplified to 30 m.
+
+Check 1, scene QA, has to be applied upstream when the reflectance data are prepared, with the functions in [`regional_clarity/R/siteSR_qa.R`](https://github.com/rossyndicate/regional-clarity-RS-model/blob/main/regional_clarity/R/siteSR_qa.R).
 
 ## Limitations
 
@@ -279,6 +288,23 @@ Check 1, scene QA, has to be applied upstream when the reflectance data are prep
 - **Point estimates only.** The ensemble spread (about 0.12 m) reflects model variance, not total predictive uncertainty. Typical error is about 1.3 m, and up to about 2 m for unfavorable sets of basins.
 - **Static catchment features.** Land cover is fixed at NLCD 2006 for all dates, so land-use change is not represented.
 - **Sensor balance.** Landsat 8/9 make up 15% of training matchups. Landsat 4 contributes only 48 matchups.
+
+## Related model
+
+The [band-only model](https://huggingface.co/bgsteele/intermountain-west-regional-clarity-sdd-landsat-band-only) was built from the same data, holdout, CV folds, and procedure, with the candidate pool restricted to the harmonized bands, spectral indices, and LaSRC flag. Because each seed's folds are identical between the two models, every comparison below is paired.
+
+| | Production (this model) | Band-only |
+|---|---|---|
+| Inputs | Bands, indices, LaSRC flag, catchment, shoreline flag, antecedent weather | Bands, indices, LaSRC flag |
+| External data needed at inference | LakeCat (EPA StreamCat), elevation tiles, gridMET | None |
+| Features per seed | 26–33 | 12–13 |
+| Holdout RMSE / MAE | 1.257 / 0.941 m | 1.356 / 1.002 m |
+| Holdout bias / R² | +0.152 m / 0.627 | +0.082 m / 0.565 |
+| Holdout RMSE across 16 draws, mean (range) | 1.46 (1.01–1.99) m | 1.58 (1.05–2.19) m |
+| Superseded matchups passing all checks, RMSE | 1.19 m (n = 2,715) | 1.37 m (n = 2,728) |
+| Location-days passing all checks (step 07 / 07b) | 662,191 at 1,796 locations | 670,780 at 1,821 locations |
+
+The production model has the lower holdout RMSE on all 10 seeds and on all 16 holdout draws, by 0.03–0.26 m. Neither model has consistently smaller bias: across the 16 draws, the production model's absolute bias is the larger of the two on 7. Where both produce an estimate for the same location-day, the estimates correlate at r = 0.96, with a mean difference of −0.02 m and a standard deviation of 0.52 m.
 
 ## References
 

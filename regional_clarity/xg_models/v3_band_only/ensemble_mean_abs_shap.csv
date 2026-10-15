@@ -1,0 +1,12 @@
+feature,mean_abs_shap,category
+green_corr7,0.52652925,optical
+BG,0.48678178,optical
+MNDWI,0.24757144,optical
+BR,0.23874192,optical
+fai,0.20607796,optical
+NR,0.111154325,optical
+nir_corr7,0.08368765,optical
+temp_corr7,0.06776491,optical
+NDSSI,0.06364097,optical
+atm_corr_LaSRC,0.059285294,optical
+NDWI,0.025038414,optical
